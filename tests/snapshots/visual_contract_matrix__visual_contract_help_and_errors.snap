@@ -1,0 +1,100 @@
+---
+source: tests/visual_contract_matrix.rs
+assertion_line: 572
+expression: output
+---
+== explorer help ==
+  E    G                                       ×
+Explorer
+↑/↓, j/k  move
+←/→, h/l  fold/open
+Enter/Space  preview
+o  external edit
+f  file manager
+y  copy path
+/  search
+i  ignored entries
+r  refresh
+d  switch dock side
+1/2, Tab  change view
+q  close sidebar
+? / Esc  close help
+
+Search
+Tab/Shift+Tab  scope
+Alt+C  case sensitive
+Alt+R  regular expression
+Enter  navigate results
+Esc  return to Explorer
+
+== source control help ==
+  E    G                                    L  ×
+Source Control
+↑/↓, j/k  move
+←/→, h/l  fold/open
+Enter  fold/preview
+v  tree/list view
+f  file manager
+y  copy path
+r  refresh
+d  switch dock side
+1/2, Tab  change view
+q  close sidebar
+? / Esc  close help
+
+
+
+
+
+
+
+
+
+
+== non-Git workspace ==
+  E    G                                    L  ×
+No Git repository
+This folder is not tracked by Git.
+
+
+
+
+
+
+
+
+== actionable runtime error ==
+  E    G                                       ×
+git status failed; last valid status retained.
+Run git status in the root.
+
+
+
+
+
+
+
+
+== config error ==
+  E    G                                       ×
+invalid config /plugin/config.toml: width must
+be at least 24 columns
+
+
+
+
+
+
+
+
+== state recovery ==
+  E    G                                       ×
+state file is corrupt; move it aside explicitly
+before reset
+
+
+
+
+
+
+

@@ -1,0 +1,25 @@
+---
+source: tests/visual_contract_matrix.rs
+expression: output
+---
+clean: name=Rgb(205, 214, 244) circle=None badge=none
+ignored: name=Rgb(108, 112, 134) circle=None badge=none
+renamed: name=Rgb(205, 214, 244) circle=Some(Rgb(137, 180, 250)) badge=none
+added: name=Rgb(205, 214, 244) circle=Some(Rgb(166, 227, 161)) badge=none
+modified: name=Rgb(205, 214, 244) circle=Some(Rgb(249, 226, 175)) badge=none
+type changed: name=Rgb(205, 214, 244) circle=Some(Rgb(250, 179, 135)) badge=none
+deleted: name=Rgb(205, 214, 244) circle=Some(Rgb(243, 139, 168)) badge=none
+conflict: name=Rgb(205, 214, 244) circle=Some(Rgb(243, 139, 168)) badge=none
+
+priority mixed conflict+deleted => conflict
+aggregate=Conflict
+
+  E    G                                       ×
+› d clean
+› d ignored
+› d renamed                                    ⦁
+› d added                                      ⦁
+› d modified                                   ⦁
+› d type changed                               ⦁
+› d deleted                                    ⦁
+› d conflict                                   ⦁

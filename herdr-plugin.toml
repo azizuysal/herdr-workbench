@@ -1,0 +1,54 @@
+id = "herdr-workbench"
+name = "Herdr Workbench"
+version = "1.0.0"
+description = "A polished project sidebar for Herdr with Explorer, live file and content search, read-only Source Control, rich previews, file icons, and Git decorations."
+min_herdr_version = "0.7.5"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["mise", "exec", "--", "cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["./target/release/herdr-workbench", "restore"]
+
+[[panes]]
+id = "sidebar"
+title = "Herdr Workbench"
+placement = "split"
+command = ["./target/release/herdr-workbench", "sidebar"]
+
+[[panes]]
+id = "preview"
+title = "Preview"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["./target/release/herdr-workbench", "preview"]
+
+[[actions]]
+id = "show"
+title = "Show Herdr Workbench"
+description = "Show or focus Herdr Workbench in the active tab."
+contexts = ["workspace"]
+command = ["./target/release/herdr-workbench", "show"]
+
+[[actions]]
+id = "hide"
+title = "Hide Herdr Workbench"
+description = "Hide Herdr Workbench in the active tab."
+contexts = ["workspace"]
+command = ["./target/release/herdr-workbench", "hide"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle Herdr Workbench"
+description = "Show or hide Herdr Workbench in the active tab."
+contexts = ["workspace"]
+command = ["./target/release/herdr-workbench", "toggle"]
+
+[[actions]]
+id = "focus"
+title = "Focus Herdr Workbench"
+description = "Focus Herdr Workbench, showing it when necessary."
+contexts = ["workspace"]
+command = ["./target/release/herdr-workbench", "focus"]

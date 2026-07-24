@@ -1,0 +1,61 @@
+---
+source: tests/visual_contract_matrix.rs
+expression: output
+---
+terminal: bg=Reset text=Reset accent=Blue green=Green yellow=Yellow red=LightRed
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+catppuccin: bg=Reset text=Rgb(205, 214, 244) accent=Rgb(137, 180, 250) green=Rgb(166, 227, 161) yellow=Rgb(249, 226, 175) red=Rgb(243, 139, 168)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+catppuccin-latte: bg=Reset text=Rgb(76, 79, 105) accent=Rgb(30, 102, 245) green=Rgb(64, 160, 43) yellow=Rgb(223, 142, 29) red=Rgb(210, 15, 57)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+tokyo-night: bg=Reset text=Rgb(192, 202, 245) accent=Rgb(122, 162, 247) green=Rgb(158, 206, 106) yellow=Rgb(224, 175, 104) red=Rgb(247, 118, 142)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+tokyo-night-day: bg=Reset text=Rgb(55, 96, 191) accent=Rgb(46, 125, 233) green=Rgb(88, 117, 57) yellow=Rgb(140, 108, 62) red=Rgb(245, 42, 101)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+dracula: bg=Reset text=Rgb(248, 248, 242) accent=Rgb(189, 147, 249) green=Rgb(80, 250, 123) yellow=Rgb(241, 250, 140) red=Rgb(255, 85, 85)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+nord: bg=Reset text=Rgb(236, 239, 244) accent=Rgb(136, 192, 208) green=Rgb(163, 190, 140) yellow=Rgb(235, 203, 139) red=Rgb(191, 97, 106)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+gruvbox: bg=Reset text=Rgb(235, 219, 178) accent=Rgb(215, 153, 33) green=Rgb(184, 187, 38) yellow=Rgb(250, 189, 47) red=Rgb(251, 73, 52)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+gruvbox-light: bg=Reset text=Rgb(60, 56, 54) accent=Rgb(7, 102, 120) green=Rgb(121, 116, 14) yellow=Rgb(181, 118, 20) red=Rgb(157, 0, 6)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+one-dark: bg=Reset text=Rgb(171, 178, 191) accent=Rgb(97, 175, 239) green=Rgb(152, 195, 121) yellow=Rgb(229, 192, 123) red=Rgb(224, 108, 117)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+one-light: bg=Reset text=Rgb(56, 58, 66) accent=Rgb(64, 120, 242) green=Rgb(80, 161, 79) yellow=Rgb(193, 132, 1) red=Rgb(228, 86, 73)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+solarized: bg=Reset text=Rgb(147, 161, 161) accent=Rgb(38, 139, 210) green=Rgb(133, 153, 0) yellow=Rgb(181, 137, 0) red=Rgb(220, 50, 47)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+solarized-light: bg=Reset text=Rgb(101, 123, 131) accent=Rgb(38, 139, 210) green=Rgb(133, 153, 0) yellow=Rgb(181, 137, 0) red=Rgb(220, 50, 47)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+kanagawa: bg=Reset text=Rgb(220, 215, 186) accent=Rgb(126, 156, 216) green=Rgb(118, 148, 106) yellow=Rgb(192, 163, 110) red=Rgb(195, 64, 67)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+kanagawa-lotus: bg=Reset text=Rgb(84, 84, 100) accent=Rgb(77, 105, 155) green=Rgb(111, 137, 78) yellow=Rgb(119, 113, 63) red=Rgb(200, 64, 83)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+rose-pine: bg=Reset text=Rgb(224, 222, 244) accent=Rgb(196, 167, 231) green=Rgb(49, 116, 143) yellow=Rgb(246, 193, 119) red=Rgb(235, 111, 146)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+rose-pine-dawn: bg=Reset text=Rgb(70, 66, 97) accent=Rgb(144, 122, 169) green=Rgb(40, 105, 131) yellow=Rgb(234, 157, 52) red=Rgb(180, 99, 122)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+vesper: bg=Reset text=Rgb(255, 255, 255) accent=Rgb(255, 199, 153) green=Rgb(153, 255, 228) yellow=Rgb(255, 199, 153) red=Rgb(255, 128, 128)
+  Plain:   E    G                       ×
+  NerdFont:                              ×
+custom-dark: name=catppuccin bg=Rgb(4, 5, 6) accent=Rgb(1, 2, 3)
+custom-light: name=catppuccin-latte bg=Rgb(4, 5, 6) accent=Rgb(1, 2, 3)
+auto-unknown: name=terminal diagnostic=Herdr appearance was unavailable; using terminal ANSI palette

@@ -1,0 +1,21 @@
+/target/
+/.tools/
+/.idea/
+/.vscode/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+*.log
+*.tmp
+
+# AI coding assistants
+/.agents/
+/.claude/
+/.codex/
+/.cursor/
+/.windsurf/
+/AGENTS.md
+/CLAUDE.md

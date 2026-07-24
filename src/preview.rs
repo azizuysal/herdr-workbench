@@ -1,0 +1,1745 @@
+use std::{
+    env, fmt, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Paragraph, Widget},
+};
+use unicode_width::UnicodeWidthChar;
+
+use crate::{
+    PLUGIN_ID, PREVIEW_ENTRYPOINT,
+    file_tree::{FileTree, Preview, sanitize_terminal},
+    git::{GitStatusProvider, SourceControlGroup},
+    herdr::{HerdrClient, LiveHerdr},
+    highlight::{HighlightRole, HighlightedText, label},
+    media::{self, VisualPreview},
+    render::sanitize_multiline,
+    theme::{self, Palette},
+    workspace::WorkspaceRoot,
+};
+
+const ROOT_ENV: &str = "HERDR_WORKBENCH_PREVIEW_ROOT";
+const KIND_ENV: &str = "HERDR_WORKBENCH_PREVIEW_KIND";
+const PATH_ENV: &str = "HERDR_WORKBENCH_PREVIEW_PATH";
+const LINE_ENV: &str = "HERDR_WORKBENCH_PREVIEW_LINE";
+const GROUP_ENV: &str = "HERDR_WORKBENCH_PREVIEW_GROUP";
+const MAX_VISUAL_ZOOM: u8 = 5;
+const VISUAL_PAN_STEP: i64 = 8;
+const VISUAL_WHEEL_STEP: i64 = 24;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewRequest {
+    File {
+        path: PathBuf,
+        line: Option<usize>,
+    },
+    Source {
+        path: PathBuf,
+        group: SourceControlGroup,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewError(String);
+
+impl PreviewError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for PreviewError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PreviewError {}
+
+pub trait PreviewOpener: Send + Sync {
+    fn open(&self, workspace: &WorkspaceRoot, request: &PreviewRequest)
+    -> Result<(), PreviewError>;
+}
+
+pub struct HerdrPreviewOpener<C = LiveHerdr> {
+    client: C,
+}
+
+impl<C> HerdrPreviewOpener<C> {
+    pub fn new(client: C) -> Self {
+        Self { client }
+    }
+}
+
+impl<C: HerdrClient> PreviewOpener for HerdrPreviewOpener<C> {
+    fn open(
+        &self,
+        workspace: &WorkspaceRoot,
+        request: &PreviewRequest,
+    ) -> Result<(), PreviewError> {
+        let mut request_env = std::collections::BTreeMap::from([
+            (ROOT_ENV.to_string(), encode_path(workspace.path())),
+            (PATH_ENV.to_string(), encode_path(request.path())),
+        ]);
+        match request {
+            PreviewRequest::File { line, .. } => {
+                request_env.insert(KIND_ENV.to_string(), "file".to_string());
+                if let Some(line) = line {
+                    request_env.insert(LINE_ENV.to_string(), line.to_string());
+                }
+            }
+            PreviewRequest::Source { group, .. } => {
+                request_env.insert(KIND_ENV.to_string(), "source".to_string());
+                request_env.insert(GROUP_ENV.to_string(), encode_group(*group).to_string());
+            }
+        }
+        self.client
+            .request(
+                "plugin.pane.open",
+                serde_json::json!({
+                    "plugin_id": PLUGIN_ID,
+                    "entrypoint": PREVIEW_ENTRYPOINT,
+                    "placement": "popup",
+                    "focus": true,
+                    "env": request_env,
+                }),
+            )
+            .map_err(|error| PreviewError::new(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl PreviewRequest {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File { path, .. } | Self::Source { path, .. } => path,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreviewInvocation {
+    workspace: WorkspaceRoot,
+    request: PreviewRequest,
+}
+
+impl PreviewInvocation {
+    fn from_env() -> Result<Self, PreviewError> {
+        let root = decode_path(&required_env(ROOT_ENV)?)?;
+        let path = decode_path(&required_env(PATH_ENV)?)?;
+        let request = match required_env(KIND_ENV)?.as_str() {
+            "file" => PreviewRequest::File {
+                path,
+                line: env::var(LINE_ENV)
+                    .ok()
+                    .map(|line| {
+                        line.parse::<usize>()
+                            .ok()
+                            .filter(|line| *line > 0)
+                            .ok_or_else(|| PreviewError::new("invalid preview line"))
+                    })
+                    .transpose()?,
+            },
+            "source" => PreviewRequest::Source {
+                path,
+                group: decode_group(&required_env(GROUP_ENV)?)?,
+            },
+            kind => return Err(PreviewError::new(format!("invalid preview kind {kind:?}"))),
+        };
+        let workspace =
+            WorkspaceRoot::resolve(&root).map_err(|error| PreviewError::new(error.to_string()))?;
+        Ok(Self { workspace, request })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreviewContent {
+    Text(HighlightedText),
+    Visual(VisualPreview),
+}
+
+impl PreviewContent {
+    pub fn plain_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.plain_text(),
+            Self::Visual(visual) => format!(
+                "{}×{} visual preview",
+                visual.source_width, visual.source_height
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewDocument {
+    pub title: String,
+    pub content: PreviewContent,
+    pub initial_line: usize,
+    pub is_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPosition {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPosition,
+    cursor: TextPosition,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VisualViewport {
+    zoom: u8,
+    pan_x: i64,
+    pan_y: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PreviewRenderState {
+    selection: Option<TextSelection>,
+    visual_viewport: VisualViewport,
+}
+
+impl VisualViewport {
+    fn zoom_in(&mut self) {
+        self.zoom = self.zoom.saturating_add(1).min(MAX_VISUAL_ZOOM);
+    }
+
+    fn zoom_out(&mut self) {
+        self.zoom = self.zoom.saturating_sub(1);
+        if self.zoom == 0 {
+            self.pan_x = 0;
+            self.pan_y = 0;
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn pan(&mut self, horizontal: i64, vertical: i64) {
+        if self.zoom == 0 {
+            return;
+        }
+        self.pan_x = self.pan_x.saturating_add(horizontal);
+        self.pan_y = self.pan_y.saturating_add(vertical);
+    }
+}
+
+impl TextSelection {
+    fn ordered(self) -> (TextPosition, TextPosition) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
+
+impl PreviewDocument {
+    fn error(title: String, error: impl fmt::Display) -> Self {
+        Self {
+            title,
+            content: plain_content(&error.to_string(), HighlightRole::Red),
+            initial_line: 0,
+            is_error: true,
+        }
+    }
+}
+
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let invocation = PreviewInvocation::from_env()?;
+    let title = request_title(&invocation.request);
+    let document =
+        load_document(&invocation).unwrap_or_else(|error| PreviewDocument::error(title, error));
+    let visual_path = if matches!(&document.content, PreviewContent::Visual(_)) {
+        Some(
+            invocation
+                .workspace
+                .resolve_path(invocation.request.path())
+                .map_err(|error| PreviewError::new(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    terminal_loop(&document, visual_path.as_deref())
+}
+
+fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, PreviewError> {
+    let request = &invocation.request;
+    let title = request_title(request);
+    match request {
+        PreviewRequest::File { path, line } => {
+            let resolved = invocation
+                .workspace
+                .resolve_path(path)
+                .map_err(|error| PreviewError::new(error.to_string()))?;
+            if let Some(visual) = media::load(&resolved).map_err(PreviewError::new)? {
+                return Ok(PreviewDocument {
+                    title,
+                    content: PreviewContent::Visual(visual),
+                    initial_line: 0,
+                    is_error: false,
+                });
+            }
+            let tree = FileTree::new(invocation.workspace.clone(), true, false);
+            let content = match tree
+                .preview(path)
+                .map_err(|error| PreviewError::new(error.to_string()))?
+            {
+                Preview::Text {
+                    source, truncated, ..
+                } => PreviewContent::Text(
+                    HighlightedText::source(path, &source, true, truncated)
+                        .map_err(PreviewError::new)?,
+                ),
+                Preview::Binary { bytes, truncated } => plain_content(
+                    &format!(
+                        "Binary file: {bytes} bytes{}",
+                        if truncated {
+                            " (preview limit reached)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    HighlightRole::Muted,
+                ),
+            };
+            Ok(PreviewDocument {
+                title,
+                content,
+                initial_line: line.map_or(0, |line| line.saturating_sub(4)),
+                is_error: false,
+            })
+        }
+        PreviewRequest::Source { path, group } => {
+            if !invocation.workspace.is_git_worktree {
+                return Err(PreviewError::new(
+                    "Source Control preview requires a Git worktree",
+                ));
+            }
+            let provider = GitStatusProvider::new(invocation.workspace.path());
+            let snapshot = provider
+                .refresh()
+                .map_err(|error| PreviewError::new(error.to_string()))?;
+            let groups = snapshot.groups();
+            let entry = groups
+                .get(group)
+                .and_then(|entries| entries.iter().find(|entry| entry.path == *path))
+                .ok_or_else(|| {
+                    PreviewError::new(format!(
+                        "{} is no longer present in {}",
+                        path.display(),
+                        group_label(*group)
+                    ))
+                })?;
+            let content = if *group == SourceControlGroup::Untracked {
+                let resolved = invocation
+                    .workspace
+                    .resolve_path(path)
+                    .map_err(|error| PreviewError::new(error.to_string()))?;
+                if let Some(visual) = media::load(&resolved).map_err(PreviewError::new)? {
+                    PreviewContent::Visual(visual)
+                } else {
+                    let tree = FileTree::new(invocation.workspace.clone(), true, false);
+                    match tree
+                        .preview(path)
+                        .map_err(|error| PreviewError::new(error.to_string()))?
+                    {
+                        Preview::Text {
+                            source, truncated, ..
+                        } => PreviewContent::Text(
+                            HighlightedText::source(path, &source, true, truncated)
+                                .map_err(PreviewError::new)?
+                                .prepend(label(
+                                    format!(
+                                        "untracked: {}",
+                                        sanitize_terminal(&path.display().to_string())
+                                    ),
+                                    HighlightRole::Green,
+                                )),
+                        ),
+                        Preview::Binary { bytes, truncated } => plain_content(
+                            &format!(
+                                "untracked binary: {} · {bytes} bytes{}",
+                                sanitize_terminal(&path.display().to_string()),
+                                if truncated {
+                                    " · preview truncated"
+                                } else {
+                                    ""
+                                }
+                            ),
+                            HighlightRole::Muted,
+                        ),
+                    }
+                }
+            } else {
+                let diff = provider
+                    .preview(entry, *group)
+                    .map_err(|error| PreviewError::new(error.to_string()))?;
+                PreviewContent::Text(HighlightedText::diff(path, &diff).map_err(PreviewError::new)?)
+            };
+            Ok(PreviewDocument {
+                title,
+                content,
+                initial_line: 0,
+                is_error: false,
+            })
+        }
+    }
+}
+
+fn request_title(request: &PreviewRequest) -> String {
+    match request {
+        PreviewRequest::File { path, .. } => sanitize_terminal(&path.display().to_string()),
+        PreviewRequest::Source { path, group } => {
+            format!(
+                "{} · {}",
+                group_label(*group),
+                sanitize_terminal(&path.display().to_string())
+            )
+        }
+    }
+}
+
+fn plain_content(text: &str, role: HighlightRole) -> PreviewContent {
+    PreviewContent::Text(HighlightedText::plain(&sanitize_multiline(text), role))
+}
+
+fn group_label(group: SourceControlGroup) -> &'static str {
+    match group {
+        SourceControlGroup::MergeChanges => "Merge Changes",
+        SourceControlGroup::StagedChanges => "Staged Changes",
+        SourceControlGroup::Changes => "Changes",
+        SourceControlGroup::Untracked => "Untracked",
+    }
+}
+
+fn encode_group(group: SourceControlGroup) -> &'static str {
+    match group {
+        SourceControlGroup::MergeChanges => "merge",
+        SourceControlGroup::StagedChanges => "staged",
+        SourceControlGroup::Changes => "changes",
+        SourceControlGroup::Untracked => "untracked",
+    }
+}
+
+fn decode_group(value: &str) -> Result<SourceControlGroup, PreviewError> {
+    match value {
+        "merge" => Ok(SourceControlGroup::MergeChanges),
+        "staged" => Ok(SourceControlGroup::StagedChanges),
+        "changes" => Ok(SourceControlGroup::Changes),
+        "untracked" => Ok(SourceControlGroup::Untracked),
+        _ => Err(PreviewError::new(format!(
+            "invalid Source Control preview group {value:?}"
+        ))),
+    }
+}
+
+fn required_env(key: &str) -> Result<String, PreviewError> {
+    env::var(key).map_err(|_| PreviewError::new(format!("missing {key}")))
+}
+
+fn encode_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.as_os_str().to_string_lossy().as_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_path(value: &str) -> Result<PathBuf, PreviewError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(PreviewError::new("invalid encoded preview path"));
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| PreviewError::new("invalid encoded preview path"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| PreviewError::new("invalid encoded preview path"))
+    }
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = disable_raw_mode();
+    }
+}
+
+fn terminal_loop(
+    document: &PreviewDocument,
+    visual_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut document = document.clone();
+    let _guard = TerminalGuard::enter()?;
+    let (theme_path, mut resolved_theme, _) = theme::load_from_env();
+    if theme::terminal_appearance().is_none()
+        && let Some(appearance) = theme::query_terminal_appearance()
+        && let Some(path) = theme_path
+    {
+        resolved_theme =
+            theme::resolve_config(&path, Some(appearance)).map_err(PreviewError::new)?;
+    }
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    let mut vertical = document.initial_line;
+    let mut horizontal = 0_usize;
+    let mut selection = None;
+    let mut visual_viewport = VisualViewport::default();
+    let mut help_visible = false;
+    let mut dirty = true;
+
+    loop {
+        let mut content_width = 1_usize;
+        let mut content_height = 1_usize;
+        if dirty {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                content_width = usize::from(area.width);
+                content_height = usize::from(area.height).max(1);
+                vertical = vertical.min(max_vertical_scroll(&document, content_height));
+                horizontal = horizontal.min(max_horizontal_scroll(&document, content_width));
+                if help_visible {
+                    render_preview_help(
+                        frame.buffer_mut(),
+                        area,
+                        &resolved_theme.palette,
+                        matches!(&document.content, PreviewContent::Visual(_)),
+                    );
+                } else {
+                    render_preview_with_selection(
+                        frame.buffer_mut(),
+                        area,
+                        &document,
+                        vertical,
+                        horizontal,
+                        &resolved_theme.palette,
+                        PreviewRenderState {
+                            selection,
+                            visual_viewport,
+                        },
+                    );
+                }
+            })?;
+            dirty = false;
+        } else {
+            let area = terminal.size()?;
+            content_width = usize::from(area.width);
+            content_height = usize::from(area.height).max(1);
+        }
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if help_visible {
+                        match key.code {
+                            KeyCode::Char('?') | KeyCode::Esc => {
+                                help_visible = false;
+                                dirty = true;
+                            }
+                            KeyCode::Char('q') | KeyCode::Char(' ') => return Ok(()),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('?') {
+                        help_visible = true;
+                        dirty = true;
+                        continue;
+                    }
+                    if select_all_requested(key) {
+                        selection = match &document.content {
+                            PreviewContent::Text(text) => select_all(text),
+                            PreviewContent::Visual(_) => None,
+                        };
+                        dirty = true;
+                        continue;
+                    }
+                    if copy_requested(key)
+                        && let PreviewContent::Text(text) = &document.content
+                        && let Some(selected) =
+                            selection.and_then(|selection| selected_text(text, selection))
+                    {
+                        if let Err(error) = crate::clipboard::copy_text(&selected) {
+                            document = PreviewDocument::error(document.title.clone(), error);
+                            selection = None;
+                            vertical = 0;
+                            horizontal = 0;
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    if key.code == KeyCode::Esc && selection.take().is_some() {
+                        dirty = true;
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('o')
+                        && matches!(&document.content, PreviewContent::Visual(_))
+                    {
+                        let result = visual_path
+                            .ok_or_else(|| {
+                                PreviewError::new(
+                                    "the visual preview path is unavailable for system preview",
+                                )
+                            })
+                            .and_then(|path| {
+                                crate::system_preview::open(path)
+                                    .map_err(|error| PreviewError::new(error.to_string()))
+                            });
+                        if let Err(error) = result {
+                            document = PreviewDocument::error(document.title.clone(), error);
+                            vertical = 0;
+                            horizontal = 0;
+                            visual_viewport.reset();
+                        }
+                        dirty = true;
+                        continue;
+                    }
+                    if handle_preview_key(
+                        key,
+                        &mut document,
+                        content_height,
+                        content_width,
+                        &mut vertical,
+                        &mut horizontal,
+                        &mut visual_viewport,
+                    ) {
+                        return Ok(());
+                    }
+                    dirty = true;
+                }
+                Event::Mouse(mouse) => {
+                    let area = terminal.size()?.into();
+                    if handle_selection_mouse(
+                        mouse,
+                        &document,
+                        area,
+                        vertical,
+                        horizontal,
+                        &mut selection,
+                    ) {
+                        dirty = true;
+                        continue;
+                    }
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            if visual_viewport.zoom > 0
+                                && matches!(&document.content, PreviewContent::Visual(_))
+                            {
+                                visual_viewport.pan(0, -VISUAL_WHEEL_STEP);
+                            } else if !move_pdf_page(&mut document, -1) {
+                                vertical = vertical.saturating_sub(3);
+                            }
+                            dirty = true;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if visual_viewport.zoom > 0
+                                && matches!(&document.content, PreviewContent::Visual(_))
+                            {
+                                visual_viewport.pan(0, VISUAL_WHEEL_STEP);
+                            } else if !move_pdf_page(&mut document, 1) {
+                                vertical = vertical
+                                    .saturating_add(3)
+                                    .min(max_vertical_scroll(&document, content_height));
+                            }
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Resize(_, _) => dirty = true,
+                Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+            }
+        }
+    }
+}
+
+fn select_all_requested(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('a')
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+fn copy_requested(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('y')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        || key.code == KeyCode::Char('c')
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+fn handle_preview_key(
+    key: KeyEvent,
+    document: &mut PreviewDocument,
+    content_height: usize,
+    content_width: usize,
+    vertical: &mut usize,
+    horizontal: &mut usize,
+    visual_viewport: &mut VisualViewport,
+) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
+        || matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(' ')
+        )
+    {
+        return true;
+    }
+    if matches!(&document.content, PreviewContent::Visual(_)) {
+        match key.code {
+            KeyCode::Char('+') | KeyCode::Char('=') => visual_viewport.zoom_in(),
+            KeyCode::Char('-') => visual_viewport.zoom_out(),
+            KeyCode::Char('0') => visual_viewport.reset(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                visual_viewport.pan(-VISUAL_PAN_STEP, 0);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                visual_viewport.pan(VISUAL_PAN_STEP, 0);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                visual_viewport.pan(0, -VISUAL_PAN_STEP);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                visual_viewport.pan(0, VISUAL_PAN_STEP);
+            }
+            KeyCode::PageUp => {
+                move_pdf_page(document, -1);
+            }
+            KeyCode::PageDown => {
+                move_pdf_page(document, 1);
+            }
+            KeyCode::Home => {
+                move_pdf_to_boundary(document, false);
+            }
+            KeyCode::End => {
+                move_pdf_to_boundary(document, true);
+            }
+            _ => {}
+        }
+        return false;
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => *vertical = vertical.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            *vertical = vertical
+                .saturating_add(1)
+                .min(max_vertical_scroll(document, content_height));
+        }
+        KeyCode::PageUp => *vertical = vertical.saturating_sub(content_height),
+        KeyCode::PageDown => {
+            *vertical = vertical
+                .saturating_add(content_height)
+                .min(max_vertical_scroll(document, content_height));
+        }
+        KeyCode::Home => *vertical = 0,
+        KeyCode::End => *vertical = max_vertical_scroll(document, content_height),
+        KeyCode::Left | KeyCode::Char('h') => *horizontal = horizontal.saturating_sub(4),
+        KeyCode::Right | KeyCode::Char('l') => {
+            *horizontal = horizontal
+                .saturating_add(4)
+                .min(max_horizontal_scroll(document, content_width));
+        }
+        _ => {}
+    }
+    false
+}
+
+fn move_pdf_page(document: &mut PreviewDocument, delta: isize) -> bool {
+    let PreviewContent::Visual(visual) = &mut document.content else {
+        return false;
+    };
+    let (Some(page_count), Some(page_index)) = (visual.page_count, visual.page_index) else {
+        return false;
+    };
+    let target = page_index
+        .saturating_add_signed(delta)
+        .min(page_count.saturating_sub(1));
+    if target != page_index
+        && let Err(error) = visual.show_pdf_page(target)
+    {
+        *document = PreviewDocument::error(document.title.clone(), error);
+    }
+    true
+}
+
+fn move_pdf_to_boundary(document: &mut PreviewDocument, end: bool) -> bool {
+    let PreviewContent::Visual(visual) = &mut document.content else {
+        return false;
+    };
+    let (Some(page_count), Some(page_index)) = (visual.page_count, visual.page_index) else {
+        return false;
+    };
+    let target = if end { page_count.saturating_sub(1) } else { 0 };
+    if target != page_index
+        && let Err(error) = visual.show_pdf_page(target)
+    {
+        *document = PreviewDocument::error(document.title.clone(), error);
+    }
+    true
+}
+
+pub fn render_preview(
+    buffer: &mut Buffer,
+    area: Rect,
+    document: &PreviewDocument,
+    vertical: usize,
+    horizontal: usize,
+    palette: &Palette,
+) {
+    render_preview_with_selection(
+        buffer,
+        area,
+        document,
+        vertical,
+        horizontal,
+        palette,
+        PreviewRenderState::default(),
+    );
+}
+
+fn render_preview_help(buffer: &mut Buffer, area: Rect, palette: &Palette, is_visual: bool) {
+    Block::default()
+        .style(Style::default().bg(palette.panel_bg))
+        .render(area, buffer);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let key = Style::default()
+        .fg(palette.accent)
+        .bg(palette.panel_bg)
+        .add_modifier(Modifier::BOLD);
+    let action = Style::default().fg(palette.text).bg(palette.panel_bg);
+    let muted = Style::default().fg(palette.overlay0).bg(palette.panel_bg);
+    let shortcut = |keys: &'static str, description: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("{keys:<19}"), key),
+            Span::styled(description, action),
+        ])
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        "Preview shortcuts",
+        key.add_modifier(Modifier::UNDERLINED),
+    ))];
+    if is_visual {
+        lines.extend([
+            shortcut("+ / -", "zoom in / out"),
+            shortcut("0", "fit to window"),
+            shortcut("Arrows or h/j/k/l", "pan when zoomed"),
+            shortcut("Mouse wheel", "pan / PDF page"),
+            shortcut("PgUp/PgDn", "previous / next PDF page"),
+            shortcut("Home/End", "first / last PDF page"),
+            shortcut("o", native_visual_action()),
+            shortcut("Esc", "close preview"),
+            shortcut("Space or q", "close preview"),
+            shortcut("?", "close this help"),
+        ]);
+    } else {
+        lines.extend([
+            shortcut("Mouse drag", "select text"),
+            shortcut("Cmd+A / Ctrl+A", "select all text"),
+            shortcut("Cmd+C / Ctrl+C", "copy selected text"),
+            shortcut("y", "copy selected text"),
+            shortcut("Up/Down or j/k", "scroll vertically"),
+            shortcut("PgUp/PgDn", "scroll by page"),
+            shortcut("Home/End", "first / last line"),
+            shortcut("Left/Right or h/l", "scroll horizontally"),
+            shortcut("Mouse wheel", "scroll vertically"),
+            shortcut("Esc", "clear selection / close"),
+            shortcut("Space or q", "close preview"),
+            shortcut("?", "close this help"),
+            Line::from(Span::styled("Cmd keys require terminal forwarding", muted)),
+        ]);
+    }
+    Paragraph::new(lines)
+        .style(Style::default().bg(palette.panel_bg))
+        .render(area, buffer);
+}
+
+#[cfg(target_os = "macos")]
+fn native_visual_action() -> &'static str {
+    "open in Quick Look"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_visual_action() -> &'static str {
+    "open in system viewer"
+}
+
+fn render_preview_with_selection(
+    buffer: &mut Buffer,
+    area: Rect,
+    document: &PreviewDocument,
+    vertical: usize,
+    horizontal: usize,
+    palette: &Palette,
+    state: PreviewRenderState,
+) {
+    Block::default()
+        .style(Style::default().bg(palette.panel_bg))
+        .render(area, buffer);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    match &document.content {
+        PreviewContent::Text(text) => {
+            let lines = text
+                .lines
+                .iter()
+                .map(|line| {
+                    Line::from(
+                        line.spans
+                            .iter()
+                            .map(|span| {
+                                let mut style = Style::default()
+                                    .fg(role_color(span.role, palette))
+                                    .bg(palette.panel_bg);
+                                if span.bold {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                }
+                                if span.italic {
+                                    style = style.add_modifier(Modifier::ITALIC);
+                                }
+                                Span::styled(span.text.as_str(), style)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Paragraph::new(lines)
+                .style(
+                    Style::default()
+                        .fg(if document.is_error {
+                            palette.red
+                        } else {
+                            palette.text
+                        })
+                        .bg(palette.panel_bg),
+                )
+                .scroll((
+                    u16::try_from(vertical).unwrap_or(u16::MAX),
+                    u16::try_from(horizontal).unwrap_or(u16::MAX),
+                ))
+                .render(area, buffer);
+            if let Some(selection) = state.selection {
+                render_selection(
+                    buffer,
+                    area,
+                    text,
+                    vertical,
+                    horizontal,
+                    selection,
+                    palette.surface1,
+                );
+            }
+        }
+        PreviewContent::Visual(visual) => {
+            render_visual(buffer, area, visual, palette, state.visual_viewport);
+        }
+    }
+}
+
+fn handle_selection_mouse(
+    mouse: MouseEvent,
+    document: &PreviewDocument,
+    area: Rect,
+    vertical: usize,
+    horizontal: usize,
+    selection: &mut Option<TextSelection>,
+) -> bool {
+    let PreviewContent::Text(text) = &document.content else {
+        return false;
+    };
+    let selection_cell = || {
+        if mouse.column < area.x
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row < area.y
+            || mouse.row >= area.y.saturating_add(area.height)
+        {
+            return None;
+        }
+        let line = vertical + usize::from(mouse.row - area.y);
+        let column = horizontal + usize::from(mouse.column - area.x);
+        text_cell_boundaries(text, line, column)
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((start, end)) = selection_cell() else {
+                return false;
+            };
+            *selection = Some(TextSelection {
+                anchor: start,
+                cursor: end,
+            });
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+            let Some(current) = *selection else {
+                return false;
+            };
+            let Some((start, end)) = selection_cell() else {
+                return false;
+            };
+            let cursor = if start < current.anchor { start } else { end };
+            *selection = Some(TextSelection {
+                anchor: current.anchor,
+                cursor,
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn text_cell_boundaries(
+    text: &HighlightedText,
+    line: usize,
+    display_column: usize,
+) -> Option<(TextPosition, TextPosition)> {
+    let line_text = text.lines.get(line)?.plain_text();
+    let characters = line_text.chars().collect::<Vec<_>>();
+    let mut display = 0_usize;
+    for (index, character) in characters.iter().enumerate() {
+        let width = UnicodeWidthChar::width(*character).unwrap_or(0);
+        if width > 0 && display_column < display.saturating_add(width) {
+            let mut end = index + 1;
+            while end < characters.len()
+                && UnicodeWidthChar::width(characters[end]).unwrap_or(0) == 0
+            {
+                end += 1;
+            }
+            return Some((
+                TextPosition {
+                    line,
+                    column: index,
+                },
+                TextPosition { line, column: end },
+            ));
+        }
+        display = display.saturating_add(width);
+    }
+    let end = TextPosition {
+        line,
+        column: characters.len(),
+    };
+    Some((end, end))
+}
+
+fn select_all(text: &HighlightedText) -> Option<TextSelection> {
+    let last_line = text.lines.len().checked_sub(1)?;
+    let end_column = text.lines[last_line].plain_text().chars().count();
+    let selection = TextSelection {
+        anchor: TextPosition { line: 0, column: 0 },
+        cursor: TextPosition {
+            line: last_line,
+            column: end_column,
+        },
+    };
+    selected_text(text, selection).map(|_| selection)
+}
+
+fn selected_text(text: &HighlightedText, selection: TextSelection) -> Option<String> {
+    let (start, end) = selection.ordered();
+    if start == end || start.line >= text.lines.len() || end.line >= text.lines.len() {
+        return None;
+    }
+    let mut selected = String::new();
+    for line_index in start.line..=end.line {
+        if line_index > start.line {
+            selected.push('\n');
+        }
+        let line = text.lines[line_index].plain_text();
+        let length = line.chars().count();
+        let from = if line_index == start.line {
+            start.column.min(length)
+        } else {
+            0
+        };
+        let to = if line_index == end.line {
+            end.column.min(length)
+        } else {
+            length
+        };
+        selected.extend(line.chars().skip(from).take(to.saturating_sub(from)));
+    }
+    Some(selected)
+}
+
+fn render_selection(
+    buffer: &mut Buffer,
+    area: Rect,
+    text: &HighlightedText,
+    vertical: usize,
+    horizontal: usize,
+    selection: TextSelection,
+    background: Color,
+) {
+    let (start, end) = selection.ordered();
+    for viewport_row in 0..usize::from(area.height) {
+        let line_index = vertical + viewport_row;
+        if line_index < start.line || line_index > end.line {
+            continue;
+        }
+        let Some(line) = text.lines.get(line_index) else {
+            break;
+        };
+        let line = line.plain_text();
+        let length = line.chars().count();
+        let from = if line_index == start.line {
+            start.column.min(length)
+        } else {
+            0
+        };
+        let to = if line_index == end.line {
+            end.column.min(length)
+        } else {
+            length
+        };
+        let display_start = display_width_to(&line, from);
+        let display_end = display_width_to(&line, to);
+        let viewport_start = horizontal;
+        let viewport_end = horizontal.saturating_add(usize::from(area.width));
+        for display_column in display_start.max(viewport_start)..display_end.min(viewport_end) {
+            let x = area.x + u16::try_from(display_column - viewport_start).unwrap_or(u16::MAX);
+            let y = area.y + u16::try_from(viewport_row).unwrap_or(u16::MAX);
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_bg(background);
+            }
+        }
+    }
+}
+
+fn display_width_to(text: &str, character_count: usize) -> usize {
+    text.chars()
+        .take(character_count)
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
+fn max_vertical_scroll(document: &PreviewDocument, content_height: usize) -> usize {
+    match &document.content {
+        PreviewContent::Text(text) => text.lines.len().max(1).saturating_sub(content_height),
+        PreviewContent::Visual(_) => 0,
+    }
+}
+
+fn max_horizontal_scroll(document: &PreviewDocument, content_width: usize) -> usize {
+    match &document.content {
+        PreviewContent::Text(text) => text.width().saturating_sub(content_width),
+        PreviewContent::Visual(_) => 0,
+    }
+}
+
+fn role_color(role: HighlightRole, palette: &Palette) -> Color {
+    match role {
+        HighlightRole::Text => palette.text,
+        HighlightRole::Muted => palette.overlay0,
+        HighlightRole::Accent => palette.accent,
+        HighlightRole::Green => palette.green,
+        HighlightRole::Yellow => palette.yellow,
+        HighlightRole::Red => palette.red,
+        HighlightRole::Blue => palette.blue,
+        HighlightRole::Teal => palette.teal,
+        HighlightRole::Peach => palette.peach,
+    }
+}
+
+fn render_visual(
+    buffer: &mut Buffer,
+    area: Rect,
+    visual: &VisualPreview,
+    palette: &Palette,
+    viewport: VisualViewport,
+) {
+    let target_width = u32::from(area.width);
+    let target_height = u32::from(area.height).saturating_mul(2);
+    if target_width == 0 || target_height == 0 {
+        return;
+    }
+    let fitted = image::imageops::thumbnail(&visual.pixels, target_width, target_height);
+    let zoom_factor = 1_u32 << viewport.zoom;
+    let resized = if viewport.zoom == 0 {
+        fitted
+    } else {
+        image::imageops::thumbnail(
+            &visual.pixels,
+            fitted
+                .width()
+                .saturating_mul(zoom_factor)
+                .min(visual.pixels.width()),
+            fitted
+                .height()
+                .saturating_mul(zoom_factor)
+                .min(visual.pixels.height()),
+        )
+    };
+    let x_offset = visual_draw_offset(target_width, resized.width(), viewport.pan_x);
+    let y_offset = visual_draw_offset(target_height, resized.height(), viewport.pan_y);
+
+    for cell_y in 0..area.height {
+        for cell_x in 0..area.width {
+            let pixel_x = i64::from(cell_x) - x_offset;
+            let top_y = i64::from(cell_y) * 2 - y_offset;
+            let bottom_y = top_y + 1;
+            let top = visual_pixel(&resized, pixel_x, top_y, palette.panel_bg);
+            let bottom = visual_pixel(&resized, pixel_x, bottom_y, palette.panel_bg);
+            let cell = &mut buffer[(area.x + cell_x, area.y + cell_y)];
+            match (top, bottom) {
+                (None, None) => {}
+                (Some(top), None) => {
+                    cell.set_symbol("▀");
+                    cell.set_style(Style::default().fg(top).bg(palette.panel_bg));
+                }
+                (None, Some(bottom)) => {
+                    cell.set_symbol("▄");
+                    cell.set_style(Style::default().fg(bottom).bg(palette.panel_bg));
+                }
+                (Some(top), Some(bottom)) => {
+                    cell.set_symbol("▀");
+                    cell.set_style(Style::default().fg(top).bg(bottom));
+                }
+            }
+        }
+    }
+}
+
+fn visual_draw_offset(viewport_extent: u32, image_extent: u32, pan: i64) -> i64 {
+    if image_extent <= viewport_extent {
+        return i64::from(viewport_extent.saturating_sub(image_extent) / 2);
+    }
+    let max_origin = i64::from(image_extent - viewport_extent);
+    let origin = (max_origin / 2).saturating_add(pan).clamp(0, max_origin);
+    -origin
+}
+
+fn visual_pixel(
+    image: &image::RgbaImage,
+    x: i64,
+    y: i64,
+    panel_background: Color,
+) -> Option<Color> {
+    let x = u32::try_from(x).ok()?;
+    let y = u32::try_from(y).ok()?;
+    let pixel = image.get_pixel_checked(x, y)?.0;
+    match pixel[3] {
+        0..=15 => None,
+        255 => Some(Color::Rgb(pixel[0], pixel[1], pixel[2])),
+        alpha => {
+            let Color::Rgb(background_red, background_green, background_blue) = panel_background
+            else {
+                return Some(Color::Rgb(pixel[0], pixel[1], pixel[2]));
+            };
+            let blend = |foreground: u8, background: u8| {
+                let alpha = u16::from(alpha);
+                ((u16::from(foreground) * alpha
+                    + u16::from(background) * (u16::from(u8::MAX) - alpha))
+                    / u16::from(u8::MAX)) as u8
+            };
+            Some(Color::Rgb(
+                blend(pixel[0], background_red),
+                blend(pixel[1], background_green),
+                blend(pixel[2], background_blue),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::herdr::FakeHerdr;
+
+    #[test]
+    fn opener_uses_a_declared_popup_and_hex_encoded_paths() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let workspace = WorkspaceRoot::resolve(directory.path()).expect("workspace");
+        let opener = HerdrPreviewOpener::new(FakeHerdr::new([Ok(serde_json::json!({}))]));
+        let request = PreviewRequest::File {
+            path: PathBuf::from("folder/file name.rs"),
+            line: Some(42),
+        };
+
+        opener.open(&workspace, &request).expect("open popup");
+
+        let calls = opener.client.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "plugin.pane.open");
+        assert_eq!(calls[0].1["plugin_id"], PLUGIN_ID);
+        assert_eq!(calls[0].1["entrypoint"], PREVIEW_ENTRYPOINT);
+        assert_eq!(calls[0].1["placement"], "popup");
+        assert_eq!(calls[0].1["focus"], true);
+        assert!(calls[0].1.get("cwd").is_none());
+        assert_eq!(calls[0].1["env"][KIND_ENV], "file");
+        assert_eq!(calls[0].1["env"][LINE_ENV], "42");
+        assert_eq!(
+            decode_path(calls[0].1["env"][PATH_ENV].as_str().unwrap()).unwrap(),
+            Path::new("folder/file name.rs")
+        );
+    }
+
+    #[test]
+    fn file_document_is_root_bound_and_starts_near_a_search_match() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            directory.path().join("notes.txt"),
+            (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("fixture");
+        let invocation = PreviewInvocation {
+            workspace: WorkspaceRoot::resolve(directory.path()).expect("workspace"),
+            request: PreviewRequest::File {
+                path: PathBuf::from("notes.txt"),
+                line: Some(12),
+            },
+        };
+
+        let document = load_document(&invocation).expect("preview");
+
+        assert!(document.content.plain_text().contains("  12  line 12"));
+        assert_eq!(document.initial_line, 8);
+        let escaping = PreviewInvocation {
+            workspace: invocation.workspace,
+            request: PreviewRequest::File {
+                path: PathBuf::from("../outside.txt"),
+                line: None,
+            },
+        };
+        assert!(load_document(&escaping).is_err());
+    }
+
+    #[test]
+    fn popup_renderer_is_content_only_and_sanitizes_content() {
+        let area = Rect::new(0, 0, 32, 5);
+        let mut buffer = Buffer::empty(area);
+        let document = PreviewDocument {
+            title: "src/main.rs".to_string(),
+            content: plain_content("first\nsecond\u{1b}[31m", HighlightRole::Text),
+            initial_line: 0,
+            is_error: false,
+        };
+
+        render_preview(&mut buffer, area, &document, 0, 0, &Palette::catppuccin());
+
+        let rendered = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("Preview"));
+        assert!(!rendered.contains("src/main.rs"));
+        assert!(!rendered.contains("Esc close"));
+        assert!(rendered.contains("second�[31m"));
+        assert!(!rendered.contains("Explorer"));
+    }
+
+    #[test]
+    fn arrows_and_page_keys_scroll_the_preview_viewport() {
+        let mut document = PreviewDocument {
+            title: "long.txt".to_string(),
+            content: plain_content(
+                &(1..=100)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                HighlightRole::Text,
+            ),
+            initial_line: 0,
+            is_error: false,
+        };
+        let mut vertical = 0;
+        let mut horizontal = 0;
+        let mut visual_viewport = VisualViewport::default();
+        let mut key = |code, vertical: &mut usize, horizontal: &mut usize| {
+            handle_preview_key(
+                crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
+                &mut document,
+                10,
+                40,
+                vertical,
+                horizontal,
+                &mut visual_viewport,
+            )
+        };
+
+        assert!(!key(KeyCode::Down, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 1);
+        assert!(!key(KeyCode::PageDown, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 11);
+        assert!(!key(KeyCode::PageUp, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 1);
+        assert!(!key(KeyCode::End, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 90);
+        assert!(!key(KeyCode::Home, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 0);
+        assert!(!key(KeyCode::Up, &mut vertical, &mut horizontal));
+        assert_eq!(vertical, 0);
+        assert!(key(KeyCode::Esc, &mut vertical, &mut horizontal));
+    }
+
+    #[test]
+    fn mouse_drag_selects_visible_multiline_text_for_copy() {
+        let document = PreviewDocument {
+            title: "notes.txt".to_string(),
+            content: plain_content("alpha\nbeta", HighlightRole::Text),
+            initial_line: 0,
+            is_error: false,
+        };
+        let mut selection = None;
+        let area = Rect::new(0, 0, 10, 2);
+
+        assert!(handle_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &document,
+            area,
+            0,
+            0,
+            &mut selection,
+        ));
+        assert!(handle_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &document,
+            area,
+            0,
+            0,
+            &mut selection,
+        ));
+
+        let PreviewContent::Text(text) = &document.content else {
+            panic!("text preview");
+        };
+        assert_eq!(
+            selection.and_then(|selection| selected_text(text, selection)),
+            Some("lpha\nbet".to_string())
+        );
+    }
+
+    #[test]
+    fn select_all_copies_exact_rendered_text_and_selection_preserves_syntax_color() {
+        let highlighted =
+            HighlightedText::source(Path::new("main.rs"), "fn main() {}", false, false)
+                .expect("highlight");
+        let selection = select_all(&highlighted).expect("non-empty selection");
+        assert_eq!(
+            selected_text(&highlighted, selection),
+            Some("fn main() {}".to_string())
+        );
+        let document = PreviewDocument {
+            title: "main.rs".to_string(),
+            content: PreviewContent::Text(highlighted),
+            initial_line: 0,
+            is_error: false,
+        };
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(area);
+        let palette = Palette::catppuccin();
+
+        render_preview_with_selection(
+            &mut buffer,
+            area,
+            &document,
+            0,
+            0,
+            &palette,
+            PreviewRenderState {
+                selection: Some(selection),
+                visual_viewport: VisualViewport::default(),
+            },
+        );
+
+        assert_eq!(buffer[(0, 0)].bg, palette.surface1);
+        assert_ne!(buffer[(0, 0)].fg, palette.surface1);
+    }
+
+    #[test]
+    fn preview_copy_and_select_all_accept_command_control_and_vim_keys() {
+        assert!(select_all_requested(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::SUPER
+        )));
+        assert!(select_all_requested(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(copy_requested(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER
+        )));
+        assert!(copy_requested(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(copy_requested(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE
+        )));
+        assert!(!copy_requested(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::SUPER
+        )));
+    }
+
+    #[test]
+    fn preview_help_renders_one_action_per_line() {
+        let area = Rect::new(0, 0, 60, 14);
+        let mut buffer = Buffer::empty(area);
+
+        render_preview_help(&mut buffer, area, &Palette::catppuccin(), false);
+
+        let rendered = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0].trim(), "Preview shortcuts");
+        assert!(rendered[1].contains("Mouse drag"));
+        assert!(rendered[2].contains("Cmd+A / Ctrl+A"));
+        assert!(rendered[3].contains("Cmd+C / Ctrl+C"));
+        assert!(rendered[4].trim_start().starts_with('y'));
+        assert!(rendered[12].trim_start().starts_with('?'));
+        assert!(rendered[13].contains("Cmd keys require terminal forwarding"));
+    }
+
+    #[test]
+    fn visual_help_exposes_zoom_pan_pdf_and_native_preview_controls() {
+        let area = Rect::new(0, 0, 60, 11);
+        let mut buffer = Buffer::empty(area);
+
+        render_preview_help(&mut buffer, area, &Palette::catppuccin(), true);
+
+        let rendered = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[1].contains("+ / -"));
+        assert!(rendered[2].contains("fit to window"));
+        assert!(rendered[3].contains("pan when zoomed"));
+        assert!(rendered[5].contains("PDF page"));
+        assert!(rendered[7].trim_start().starts_with('o'));
+        assert!(rendered[7].contains(native_visual_action()));
+        assert!(rendered[10].trim_start().starts_with('?'));
+    }
+
+    #[test]
+    fn visual_viewport_zoom_pan_and_fit_are_bounded() {
+        let mut viewport = VisualViewport::default();
+
+        viewport.pan(8, 8);
+        assert_eq!(viewport, VisualViewport::default());
+        for _ in 0..10 {
+            viewport.zoom_in();
+        }
+        assert_eq!(viewport.zoom, MAX_VISUAL_ZOOM);
+        viewport.pan(VISUAL_PAN_STEP, -VISUAL_PAN_STEP);
+        assert_eq!(
+            (viewport.pan_x, viewport.pan_y),
+            (VISUAL_PAN_STEP, -VISUAL_PAN_STEP)
+        );
+        viewport.zoom_out();
+        assert_eq!(viewport.zoom, MAX_VISUAL_ZOOM - 1);
+        viewport.reset();
+        assert_eq!(viewport, VisualViewport::default());
+
+        assert_eq!(visual_draw_offset(10, 6, 100), 2);
+        assert_eq!(visual_draw_offset(10, 30, 0), -10);
+        assert_eq!(visual_draw_offset(10, 30, -100), 0);
+        assert_eq!(visual_draw_offset(10, 30, 100), -20);
+    }
+
+    #[test]
+    fn visual_keys_zoom_pan_and_reset_without_changing_text_scroll() {
+        let pixels = image::RgbaImage::new(100, 100);
+        let mut document = PreviewDocument {
+            title: "design.png".to_string(),
+            content: PreviewContent::Visual(VisualPreview::raster(pixels, 100, 100)),
+            initial_line: 0,
+            is_error: false,
+        };
+        let mut vertical = 0;
+        let mut horizontal = 0;
+        let mut viewport = VisualViewport::default();
+
+        assert!(!handle_preview_key(
+            KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+            &mut document,
+            10,
+            20,
+            &mut vertical,
+            &mut horizontal,
+            &mut viewport,
+        ));
+        assert_eq!(viewport.zoom, 1);
+        assert!(!handle_preview_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut document,
+            10,
+            20,
+            &mut vertical,
+            &mut horizontal,
+            &mut viewport,
+        ));
+        assert!(!handle_preview_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut document,
+            10,
+            20,
+            &mut vertical,
+            &mut horizontal,
+            &mut viewport,
+        ));
+        assert_eq!(
+            (viewport.pan_x, viewport.pan_y),
+            (VISUAL_PAN_STEP, VISUAL_PAN_STEP)
+        );
+        assert_eq!((vertical, horizontal), (0, 0));
+        assert!(!handle_preview_key(
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+            &mut document,
+            10,
+            20,
+            &mut vertical,
+            &mut horizontal,
+            &mut viewport,
+        ));
+        assert_eq!(viewport, VisualViewport::default());
+    }
+
+    #[test]
+    fn visual_preview_uses_half_blocks_with_truecolor_pixels() {
+        let mut pixels = image::RgbaImage::new(1, 2);
+        pixels.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        pixels.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        let document = PreviewDocument {
+            title: "sample.png".to_string(),
+            content: PreviewContent::Visual(VisualPreview::raster(pixels, 1, 2)),
+            initial_line: 0,
+            is_error: false,
+        };
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+
+        render_preview(&mut buffer, area, &document, 0, 0, &Palette::catppuccin());
+
+        assert_eq!(buffer[(0, 0)].symbol(), "▀");
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(255, 0, 0));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn git_diff_preview_keeps_diff_and_language_semantics() {
+        let highlighted = HighlightedText::diff(
+            Path::new("src/main.rs"),
+            "@@ -1 +1 @@\n-pub fn old() -> u32 { 1 }\n+pub fn new() -> u32 { 2 }",
+        )
+        .expect("highlight");
+        let document = PreviewDocument {
+            title: "Changes · src/main.rs".to_string(),
+            content: PreviewContent::Text(highlighted),
+            initial_line: 0,
+            is_error: false,
+        };
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(area);
+        let palette = Palette::catppuccin();
+
+        render_preview(&mut buffer, area, &document, 0, 0, &palette);
+
+        assert_eq!(buffer[(0, 1)].symbol(), "-");
+        assert_eq!(buffer[(0, 1)].fg, palette.red);
+        assert_eq!(buffer[(0, 2)].symbol(), "+");
+        assert_eq!(buffer[(0, 2)].fg, palette.green);
+        assert!((1..area.width).any(|column| buffer[(column, 2)].fg == palette.blue));
+        assert!((1..area.width).any(|column| buffer[(column, 2)].fg == palette.peach));
+    }
+}

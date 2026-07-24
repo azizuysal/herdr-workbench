@@ -1,0 +1,50 @@
+---
+source: tests/visual_contract_matrix.rs
+assertion_line: 292
+expression: output
+---
+== entry ==
+  E    G                                       ×
+/ Filter files…
+Files Contents                             Aa .*
+› d src
+│ t Cargo.toml
+
+
+
+
+== active ==
+  E    G                                       ×
+/ result                                       ⠋
+Files Contents                             Aa .*
+No results
+
+
+
+
+
+== results grouped by file ==
+  E    G                                       ×
+/ result
+Files Contents                             Aa .*
+⌄ d src/app.rs (2)
+  │ f 12: exact result
+    f 42: second result
+
+
+
+== invalid expression ==
+  E    G                                       ×
+/ (result
+Files Contents                             Aa .*
+invalid regular expression: unclosed group
+
+
+
+
+
+== cancelled with prior results retained ==
+  E    G                                       ×
+/ result
+Files Contents                             Aa .*
+⌄ d prior.rs (1)

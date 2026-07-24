@@ -1,0 +1,12 @@
+width = 32
+show_ignored = true
+show_git_directory = false
+icons = "nerd-font"
+follow_symlinks = false
+restore_visible = true
+show_empty_git_groups = false
+
+[open]
+# When empty, o falls back to the inherited $EDITOR command.
+command = []
+placement = "tab"

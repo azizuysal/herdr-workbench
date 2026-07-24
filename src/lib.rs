@@ -1,0 +1,23 @@
+pub mod app;
+pub mod clipboard;
+pub mod config;
+pub mod controller;
+pub mod decoration;
+pub mod file_manager;
+pub mod file_tree;
+pub mod git;
+pub mod herdr;
+pub mod highlight;
+pub mod icons;
+pub mod media;
+pub mod preview;
+pub mod render;
+pub mod search;
+pub mod state;
+pub mod system_preview;
+pub mod theme;
+pub mod workspace;
+
+pub const PLUGIN_ID: &str = "herdr-workbench";
+pub const SIDEBAR_ENTRYPOINT: &str = "sidebar";
+pub const PREVIEW_ENTRYPOINT: &str = "preview";

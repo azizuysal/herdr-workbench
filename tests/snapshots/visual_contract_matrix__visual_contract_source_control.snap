@@ -1,0 +1,43 @@
+---
+source: tests/visual_contract_matrix.rs
+expression: output
+---
+== flat groups and dual membership ==
+  E    G                                    L  ×
+⌄ d Merge Changes (1)
+    r conflict.rs                              C
+⌄ d Staged Changes (1)
+  │ r dual.rs                                  A
+⌄ d Changes (1)
+    r dual.rs                                  M
+⌄ d Untracked (1)
+    r new.rs                                   U
+
+
+
+
+== tree groups and dual membership ==
+  E    G                                    T  ×
+⌄ d Staged Changes (1)
+  ⌄ d src                                      ⦁
+    │ r dual.rs                                A
+⌄ d Changes (1)
+  ⌄ d src                                      ⦁
+      r dual.rs                                M
+
+
+
+
+== diff ==
+diff --git a/dual.rs b/dual.rs                  
+@@ -1 +1 @@                                     
+-old                                            
++new�[31m                                       
+                                                
+                                                
+                                                
+                                                
+
+== untracked ==
+untracked: new.rs                               
+   1 │ safe content
