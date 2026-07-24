@@ -83,6 +83,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state,
         loaded_config,
         companion_monitor,
+        load_theme(),
     )?;
     loop {
         let outcome = terminal_loop(&mut application)?;
@@ -311,6 +312,7 @@ impl SidebarApp {
         persisted: PersistedState,
         loaded_config: LoadedConfig,
         companion_monitor: CompanionMonitor,
+        theme_state: (Option<PathBuf>, ThemeResolution, Option<SystemTime>),
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = loaded_config.config.clone();
         let editor = std::env::var_os("EDITOR").filter(|value| !value.is_empty());
@@ -348,7 +350,7 @@ impl SidebarApp {
             SidebarView::Explorer => View::Explorer,
             SidebarView::SourceControl => View::SourceControl,
         };
-        let (theme_path, theme, theme_modified) = load_theme();
+        let (theme_path, theme, theme_modified) = theme_state;
         let git = GitStatusProvider::new(workspace.path());
         let git_receiver = workspace.is_git_worktree.then(|| git.refresh_async());
         let busy = git_receiver.is_some();
@@ -2152,6 +2154,15 @@ mod tests {
             PersistedState::default(),
             loaded_config,
             CompanionMonitor::inactive(),
+            (
+                None,
+                ThemeResolution {
+                    palette: Palette::catppuccin(),
+                    name: "catppuccin".to_string(),
+                    diagnostic: None,
+                },
+                None,
+            ),
         )
         .expect("sidebar app");
         (directory, app)
