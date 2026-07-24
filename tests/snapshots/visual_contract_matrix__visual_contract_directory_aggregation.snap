@@ -17,9 +17,9 @@ aggregate=Conflict
   E    G                                       ×
 › d clean
 › d ignored
-› d renamed                                    ⦁
-› d added                                      ⦁
-› d modified                                   ⦁
-› d type changed                               ⦁
-› d deleted                                    ⦁
-› d conflict                                   ⦁
+› d renamed                                    ●
+› d added                                      ●
+› d modified                                   ●
+› d type changed                               ●
+› d deleted                                    ●
+› d conflict                                   ●

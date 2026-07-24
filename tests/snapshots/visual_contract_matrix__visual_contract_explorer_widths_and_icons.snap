@@ -5,8 +5,8 @@ expression: output
 
 == Plain 20 ==
   E    G           ×
-⌄ d src            ⦁
-› d collapsed      ⦁
+⌄ d src            ●
+› d collapsed      ●
   │ r selected-dua…M
     f .ignored-with…
   t clean.toml
@@ -16,8 +16,8 @@ expression: output
 
 == Plain 24 ==
   E    G               ×
-⌄ d src                ⦁
-› d collapsed          ⦁
+⌄ d src                ●
+› d collapsed          ●
   │ r selected-dual-st…M
     f .ignored-with-a-l…
   t clean.toml
@@ -27,8 +27,8 @@ expression: output
 
 == Plain 32 ==
   E    G                       ×
-⌄ d src                        ⦁
-› d collapsed                  ⦁
+⌄ d src                        ●
+› d collapsed                  ●
   │ r selected-dual-state.rs   M
     f .ignored-with-a-long-name
   t clean.toml
@@ -38,8 +38,8 @@ expression: output
 
 == Plain 48 ==
   E    G                                       ×
-⌄ d src                                        ⦁
-› d collapsed                                  ⦁
+⌄ d src                                        ●
+› d collapsed                                  ●
   │ r selected-dual-state.rs                   M
     f .ignored-with-a-long-name
   t clean.toml
@@ -49,8 +49,8 @@ expression: output
 
 == Plain 80 ==
   E    G                                                                       ×
-⌄ d src                                                                        ⦁
-› d collapsed                                                                  ⦁
+⌄ d src                                                                        ●
+› d collapsed                                                                  ●
   │ r selected-dual-state.rs                                                   M
     f .ignored-with-a-long-name
   t clean.toml
@@ -60,8 +60,8 @@ expression: output
 
 == NerdFont 20 ==
                  ×
-⌄  src            ⦁
-›  collapsed      ⦁
+⌄  src            ●
+›  collapsed      ●
   │  selected-dua…M
      .ignored-with…
    clean.toml
@@ -71,8 +71,8 @@ expression: output
 
 == NerdFont 24 ==
                      ×
-⌄  src                ⦁
-›  collapsed          ⦁
+⌄  src                ●
+›  collapsed          ●
   │  selected-dual-st…M
      .ignored-with-a-l…
    clean.toml
@@ -82,8 +82,8 @@ expression: output
 
 == NerdFont 32 ==
                              ×
-⌄  src                        ⦁
-›  collapsed                  ⦁
+⌄  src                        ●
+›  collapsed                  ●
   │  selected-dual-state.rs   M
      .ignored-with-a-long-name
    clean.toml
@@ -93,8 +93,8 @@ expression: output
 
 == NerdFont 48 ==
                                              ×
-⌄  src                                        ⦁
-›  collapsed                                  ⦁
+⌄  src                                        ●
+›  collapsed                                  ●
   │  selected-dual-state.rs                   M
      .ignored-with-a-long-name
    clean.toml
@@ -104,8 +104,8 @@ expression: output
 
 == NerdFont 80 ==
                                                                              ×
-⌄  src                                                                        ⦁
-›  collapsed                                                                  ⦁
+⌄  src                                                                        ●
+›  collapsed                                                                  ●
   │  selected-dual-state.rs                                                   M
      .ignored-with-a-long-name
    clean.toml

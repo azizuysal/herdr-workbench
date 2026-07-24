@@ -541,8 +541,7 @@ fn terminal_loop(
     let mut document = document.clone();
     let _guard = TerminalGuard::enter()?;
     let (theme_path, mut resolved_theme, _) = theme::load_from_env();
-    if theme::terminal_appearance().is_none()
-        && let Some(appearance) = theme::query_terminal_appearance()
+    if let Some(appearance) = theme::query_terminal_appearance()
         && let Some(path) = theme_path
     {
         resolved_theme =

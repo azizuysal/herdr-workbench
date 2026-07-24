@@ -151,9 +151,7 @@ impl Drop for TerminalGuard {
 
 fn terminal_loop(application: &mut SidebarApp) -> Result<LoopOutcome, Box<dyn std::error::Error>> {
     let _guard = TerminalGuard::enter()?;
-    if terminal_appearance().is_none()
-        && let Some(appearance) = query_terminal_appearance()
-    {
+    if let Some(appearance) = query_terminal_appearance() {
         application.apply_terminal_appearance(appearance);
     }
     let backend = CrosstermBackend::new(io::stdout());
@@ -196,7 +194,12 @@ fn terminal_loop(application: &mut SidebarApp) -> Result<LoopOutcome, Box<dyn st
                         return Ok(outcome);
                     }
                 }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::FocusGained => {
+                    if let Some(appearance) = query_terminal_appearance() {
+                        application.apply_terminal_appearance(appearance);
+                    }
+                }
+                Event::Resize(_, _) | Event::FocusLost | Event::Paste(_) => {}
             }
         }
     }
@@ -292,6 +295,7 @@ struct SidebarApp {
     theme: ThemeResolution,
     theme_path: Option<PathBuf>,
     theme_modified: Option<SystemTime>,
+    appearance: Option<Appearance>,
     config_modified: Option<SystemTime>,
     show_ignored: bool,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -409,6 +413,7 @@ impl SidebarApp {
             theme,
             theme_path,
             theme_modified,
+            appearance: None,
             config_modified,
             show_ignored,
             _watcher: watcher,
@@ -1632,7 +1637,7 @@ impl SidebarApp {
         if let Some(path) = &self.theme_path {
             let modified = file_modified(path);
             if modified != self.theme_modified {
-                match crate::theme::resolve_config(path, terminal_appearance()) {
+                match crate::theme::resolve_config(path, self.appearance) {
                     Ok(theme) => {
                         replace_theme_diagnostic(&mut self.error, &self.theme, &theme);
                         self.theme = theme;
@@ -1759,6 +1764,7 @@ impl SidebarApp {
     }
 
     fn apply_terminal_appearance(&mut self, appearance: Appearance) {
+        self.appearance = Some(appearance);
         let Some(path) = self.theme_path.as_ref() else {
             return;
         };
@@ -2035,29 +2041,8 @@ fn load_theme() -> (Option<PathBuf>, ThemeResolution, Option<SystemTime>) {
     crate::theme::load_from_env()
 }
 
-fn terminal_appearance() -> Option<Appearance> {
-    crate::theme::terminal_appearance()
-}
-
 fn query_terminal_appearance() -> Option<Appearance> {
     crate::theme::query_terminal_appearance()
-}
-
-#[cfg(test)]
-fn parse_terminal_appearance_response(response: &[u8]) -> Option<Appearance> {
-    if response
-        .windows(b"\x1b[?997;1n".len())
-        .any(|window| window == b"\x1b[?997;1n")
-    {
-        Some(Appearance::Dark)
-    } else if response
-        .windows(b"\x1b[?997;2n".len())
-        .any(|window| window == b"\x1b[?997;2n")
-    {
-        Some(Appearance::Light)
-    } else {
-        None
-    }
 }
 
 fn file_modified(path: &Path) -> Option<SystemTime> {
@@ -2780,19 +2765,6 @@ mod tests {
         assert_eq!(offset_for_selection(77, 0, 100, 77), 1);
         assert_eq!(offset_for_selection(99, 1, 100, 77), 23);
         assert_eq!(offset_for_selection(22, 23, 100, 77), 22);
-    }
-
-    #[test]
-    fn terminal_appearance_env_is_explicit() {
-        assert_eq!(
-            parse_terminal_appearance_response(b"noise\x1b[?997;1n"),
-            Some(Appearance::Dark)
-        );
-        assert_eq!(
-            parse_terminal_appearance_response(b"\x1b[?997;2n"),
-            Some(Appearance::Light)
-        );
-        assert_eq!(parse_terminal_appearance_response(b"unknown"), None);
     }
 
     #[test]

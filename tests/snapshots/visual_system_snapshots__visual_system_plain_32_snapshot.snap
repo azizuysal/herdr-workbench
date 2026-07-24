@@ -3,6 +3,6 @@ source: tests/visual_system_snapshots.rs
 expression: lines
 ---
   E    G                       ×
-⌄ d src                        ⦁
+⌄ d src                        ●
     r a-long-ignored-file-name.…
     r lib.rs                   M

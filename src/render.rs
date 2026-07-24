@@ -585,7 +585,7 @@ fn render_row(buffer: &mut Buffer, area: Rect, row: &RenderRow, mode: IconMode, 
     let style = row_style(decoration, row.selected, row.focused, p);
     let badge = if row.kind == EntryKind::Directory {
         if decoration.directory_circle.is_some() {
-            "⦁".to_string()
+            "●".to_string()
         } else {
             String::new()
         }
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn directory_circles_align_with_file_badges_at_the_right_edge() {
-        assert_eq!(UnicodeWidthStr::width("⦁"), 1);
+        assert_eq!(UnicodeWidthStr::width("●"), 1);
         let area = Rect::new(0, 0, 32, 4);
         let mut buffer = Buffer::empty(area);
         let status = GitCoordinates {
@@ -784,7 +784,7 @@ mod tests {
 
         render(&mut buffer, area, &model, &Palette::catppuccin());
 
-        assert_eq!(buffer[(area.width - 1, 1)].symbol(), "⦁");
+        assert_eq!(buffer[(area.width - 1, 1)].symbol(), "●");
         assert_eq!(buffer[(area.width - 1, 2)].symbol(), "M");
     }
 

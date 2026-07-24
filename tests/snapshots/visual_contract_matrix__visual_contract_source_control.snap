@@ -19,10 +19,10 @@ expression: output
 == tree groups and dual membership ==
   E    G                                    T  ×
 ⌄ d Staged Changes (1)
-  ⌄ d src                                      ⦁
+  ⌄ d src                                      ●
     │ r dual.rs                                A
 ⌄ d Changes (1)
-  ⌄ d src                                      ⦁
+  ⌄ d src                                      ●
       r dual.rs                                M
 
 

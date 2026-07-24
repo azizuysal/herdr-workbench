@@ -58,4 +58,4 @@ vesper: bg=Reset text=Rgb(255, 255, 255) accent=Rgb(255, 199, 153) green=Rgb(153
   NerdFont:                              ×
 custom-dark: name=catppuccin bg=Rgb(4, 5, 6) accent=Rgb(1, 2, 3)
 custom-light: name=catppuccin-latte bg=Rgb(4, 5, 6) accent=Rgb(1, 2, 3)
-auto-unknown: name=terminal diagnostic=Herdr appearance was unavailable; using terminal ANSI palette
+auto-unknown: name=catppuccin diagnostic=
