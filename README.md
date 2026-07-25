@@ -2,7 +2,7 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.1](https://img.shields.io/badge/version-1.0.1-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.2](https://img.shields.io/badge/version-1.0.2-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)
@@ -115,7 +115,7 @@ Outside a Git repository, Source Control shows a short muted message instead of 
 
 ### Preview, edit, and reveal
 
-`Enter` opens the selected file or diff in a centered overlay. Text previews support syntax highlighting, scrolling, selection, and copy. Known images and PDFs render in the terminal, with `+`, `-`, and `0` for zoom.
+`Enter` opens the selected file or diff in a centered overlay. Text previews support syntax highlighting, scrolling, selection, and copy. Line numbers are off by default; press `n` to show or hide them in file previews. Known images and PDFs render in the terminal, with `+`, `-`, and `0` for zoom.
 
 Press `o` to hand the file to another viewer:
 
@@ -188,6 +188,7 @@ Dock side is remembered independently for each Herdr tab.
 | `Ctrl+A` or `Cmd+A` | Select all text |
 | `Ctrl+C`, `Cmd+C`, or `y` | Copy selected text |
 | Right click | Open the Copy menu |
+| `n` | Show / hide line numbers in file previews |
 | `+` / `-` / `0` | Zoom in / out / reset visual previews |
 | `o` | Open in another viewer |
 | `?` | Open preview help |

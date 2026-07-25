@@ -120,10 +120,12 @@ impl HighlightedText {
             lines.push(HighlightLine::default());
         }
         if truncated {
-            lines.push(HighlightLine::plain(
-                format!("{:>number_width$}  … [preview truncated]", ""),
-                HighlightRole::Muted,
-            ));
+            let message = if line_numbers {
+                format!("{:>number_width$}  … [preview truncated]", "")
+            } else {
+                "… [preview truncated]".to_string()
+            };
+            lines.push(HighlightLine::plain(message, HighlightRole::Muted));
         }
         Ok(Self { lines })
     }
@@ -431,5 +433,9 @@ mod tests {
             HighlightedText::source(Path::new("data.unknown"), "safe\\x1b", true, false)
                 .expect("plain");
         assert_eq!(highlighted.plain_text(), "   1  safe\\x1b");
+
+        let without_numbers =
+            HighlightedText::source(Path::new("data.unknown"), "safe", false, true).expect("plain");
+        assert_eq!(without_numbers.plain_text(), "safe\n… [preview truncated]");
     }
 }

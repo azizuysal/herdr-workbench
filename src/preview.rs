@@ -194,6 +194,7 @@ pub struct PreviewDocument {
     pub content: PreviewContent,
     pub initial_line: usize,
     pub is_error: bool,
+    pub numbered_line_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -219,6 +220,14 @@ struct VisualViewport {
 struct PreviewRenderState {
     selection: Option<TextSelection>,
     visual_viewport: VisualViewport,
+    show_line_numbers: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SelectionRenderState {
+    vertical: usize,
+    horizontal: usize,
+    line_number_gutter_width: usize,
 }
 
 impl VisualViewport {
@@ -264,6 +273,7 @@ impl PreviewDocument {
             content: plain_content(&error.to_string(), HighlightRole::Red),
             initial_line: 0,
             is_error: true,
+            numbered_line_range: None,
         }
     }
 }
@@ -301,29 +311,39 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                     content: PreviewContent::Visual(visual),
                     initial_line: 0,
                     is_error: false,
+                    numbered_line_range: None,
                 });
             }
             let tree = FileTree::new(invocation.workspace.clone(), true, false);
-            let content = match tree
+            let (content, numbered_line_range) = match tree
                 .preview(path)
                 .map_err(|error| PreviewError::new(error.to_string()))?
             {
                 Preview::Text {
                     source, truncated, ..
-                } => PreviewContent::Text(
-                    HighlightedText::source(path, &source, true, truncated)
-                        .map_err(PreviewError::new)?,
-                ),
-                Preview::Binary { bytes, truncated } => plain_content(
-                    &format!(
-                        "Binary file: {bytes} bytes{}",
-                        if truncated {
-                            " (preview limit reached)"
-                        } else {
-                            ""
-                        }
+                } => {
+                    let line_count = source.lines().count();
+                    (
+                        PreviewContent::Text(
+                            HighlightedText::source(path, &source, false, truncated)
+                                .map_err(PreviewError::new)?,
+                        ),
+                        Some(0..line_count),
+                    )
+                }
+                Preview::Binary { bytes, truncated } => (
+                    plain_content(
+                        &format!(
+                            "Binary file: {bytes} bytes{}",
+                            if truncated {
+                                " (preview limit reached)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        HighlightRole::Muted,
                     ),
-                    HighlightRole::Muted,
+                    None,
                 ),
             };
             Ok(PreviewDocument {
@@ -331,6 +351,7 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                 content,
                 initial_line: line.map_or(0, |line| line.saturating_sub(4)),
                 is_error: false,
+                numbered_line_range,
             })
         }
         PreviewRequest::Source { path, group } => {
@@ -354,13 +375,13 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                         group_label(*group)
                     ))
                 })?;
-            let content = if *group == SourceControlGroup::Untracked {
+            let (content, numbered_line_range) = if *group == SourceControlGroup::Untracked {
                 let resolved = invocation
                     .workspace
                     .resolve_path(path)
                     .map_err(|error| PreviewError::new(error.to_string()))?;
                 if let Some(visual) = media::load(&resolved).map_err(PreviewError::new)? {
-                    PreviewContent::Visual(visual)
+                    (PreviewContent::Visual(visual), None)
                 } else {
                     let tree = FileTree::new(invocation.workspace.clone(), true, false);
                     match tree
@@ -369,28 +390,37 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                     {
                         Preview::Text {
                             source, truncated, ..
-                        } => PreviewContent::Text(
-                            HighlightedText::source(path, &source, true, truncated)
-                                .map_err(PreviewError::new)?
-                                .prepend(label(
-                                    format!(
-                                        "untracked: {}",
-                                        sanitize_terminal(&path.display().to_string())
-                                    ),
-                                    HighlightRole::Green,
-                                )),
-                        ),
-                        Preview::Binary { bytes, truncated } => plain_content(
-                            &format!(
-                                "untracked binary: {} · {bytes} bytes{}",
-                                sanitize_terminal(&path.display().to_string()),
-                                if truncated {
-                                    " · preview truncated"
-                                } else {
-                                    ""
-                                }
+                        } => {
+                            let line_count = source.lines().count();
+                            (
+                                PreviewContent::Text(
+                                    HighlightedText::source(path, &source, false, truncated)
+                                        .map_err(PreviewError::new)?
+                                        .prepend(label(
+                                            format!(
+                                                "untracked: {}",
+                                                sanitize_terminal(&path.display().to_string())
+                                            ),
+                                            HighlightRole::Green,
+                                        )),
+                                ),
+                                Some(1..line_count.saturating_add(1)),
+                            )
+                        }
+                        Preview::Binary { bytes, truncated } => (
+                            plain_content(
+                                &format!(
+                                    "untracked binary: {} · {bytes} bytes{}",
+                                    sanitize_terminal(&path.display().to_string()),
+                                    if truncated {
+                                        " · preview truncated"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                HighlightRole::Muted,
                             ),
-                            HighlightRole::Muted,
+                            None,
                         ),
                     }
                 }
@@ -398,13 +428,19 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                 let diff = provider
                     .preview(entry, *group)
                     .map_err(|error| PreviewError::new(error.to_string()))?;
-                PreviewContent::Text(HighlightedText::diff(path, &diff).map_err(PreviewError::new)?)
+                (
+                    PreviewContent::Text(
+                        HighlightedText::diff(path, &diff).map_err(PreviewError::new)?,
+                    ),
+                    None,
+                )
             };
             Ok(PreviewDocument {
                 title,
                 content,
                 initial_line: 0,
                 is_error: false,
+                numbered_line_range,
             })
         }
     }
@@ -555,6 +591,7 @@ fn terminal_loop(
     let mut selection = None;
     let mut visual_viewport = VisualViewport::default();
     let mut help_visible = false;
+    let mut show_line_numbers = false;
     let mut dirty = true;
 
     loop {
@@ -566,13 +603,18 @@ fn terminal_loop(
                 content_width = usize::from(area.width);
                 content_height = usize::from(area.height).max(1);
                 vertical = vertical.min(max_vertical_scroll(&document, content_height));
-                horizontal = horizontal.min(max_horizontal_scroll(&document, content_width));
+                horizontal = horizontal.min(max_horizontal_scroll(
+                    &document,
+                    content_width,
+                    show_line_numbers,
+                ));
                 if help_visible {
                     render_preview_help(
                         frame.buffer_mut(),
                         area,
                         &resolved_theme.palette,
                         matches!(&document.content, PreviewContent::Visual(_)),
+                        document.numbered_line_range.is_some(),
                     );
                 } else {
                     render_preview_with_selection(
@@ -585,6 +627,7 @@ fn terminal_loop(
                         PreviewRenderState {
                             selection,
                             visual_viewport,
+                            show_line_numbers,
                         },
                     );
                 }
@@ -662,11 +705,17 @@ fn terminal_loop(
                         dirty = true;
                         continue;
                     }
+                    if handle_line_number_toggle(key, &document, &mut show_line_numbers) {
+                        dirty = true;
+                        continue;
+                    }
+                    let horizontal_limit =
+                        max_horizontal_scroll(&document, content_width, show_line_numbers);
                     if handle_preview_key(
                         key,
                         &mut document,
                         content_height,
-                        content_width,
+                        horizontal_limit,
                         &mut vertical,
                         &mut horizontal,
                         &mut visual_viewport,
@@ -683,6 +732,7 @@ fn terminal_loop(
                         area,
                         vertical,
                         horizontal,
+                        show_line_numbers,
                         &mut selection,
                     ) {
                         dirty = true;
@@ -743,7 +793,7 @@ fn handle_preview_key(
     key: KeyEvent,
     document: &mut PreviewDocument,
     content_height: usize,
-    content_width: usize,
+    horizontal_limit: usize,
     vertical: &mut usize,
     horizontal: &mut usize,
     visual_viewport: &mut VisualViewport,
@@ -806,13 +856,28 @@ fn handle_preview_key(
         KeyCode::End => *vertical = max_vertical_scroll(document, content_height),
         KeyCode::Left | KeyCode::Char('h') => *horizontal = horizontal.saturating_sub(4),
         KeyCode::Right | KeyCode::Char('l') => {
-            *horizontal = horizontal
-                .saturating_add(4)
-                .min(max_horizontal_scroll(document, content_width));
+            *horizontal = horizontal.saturating_add(4).min(horizontal_limit);
         }
         _ => {}
     }
     false
+}
+
+fn handle_line_number_toggle(
+    key: KeyEvent,
+    document: &PreviewDocument,
+    show_line_numbers: &mut bool,
+) -> bool {
+    if key.code != KeyCode::Char('n')
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        || document.numbered_line_range.is_none()
+    {
+        return false;
+    }
+    *show_line_numbers = !*show_line_numbers;
+    true
 }
 
 fn move_pdf_page(document: &mut PreviewDocument, delta: isize) -> bool {
@@ -868,7 +933,13 @@ pub fn render_preview(
     );
 }
 
-fn render_preview_help(buffer: &mut Buffer, area: Rect, palette: &Palette, is_visual: bool) {
+fn render_preview_help(
+    buffer: &mut Buffer,
+    area: Rect,
+    palette: &Palette,
+    is_visual: bool,
+    line_numbers_available: bool,
+) {
     Block::default()
         .style(Style::default().bg(palette.panel_bg))
         .render(area, buffer);
@@ -910,6 +981,11 @@ fn render_preview_help(buffer: &mut Buffer, area: Rect, palette: &Palette, is_vi
             shortcut("Cmd+A / Ctrl+A", "select all text"),
             shortcut("Cmd+C / Ctrl+C", "copy selected text"),
             shortcut("y", "copy selected text"),
+        ]);
+        if line_numbers_available {
+            lines.push(shortcut("n", "toggle line numbers"));
+        }
+        lines.extend([
             shortcut("Up/Down or j/k", "scroll vertically"),
             shortcut("PgUp/PgDn", "scroll by page"),
             shortcut("Home/End", "first / last line"),
@@ -956,24 +1032,30 @@ fn render_preview_with_selection(
             let lines = text
                 .lines
                 .iter()
-                .map(|line| {
-                    Line::from(
-                        line.spans
-                            .iter()
-                            .map(|span| {
-                                let mut style = Style::default()
-                                    .fg(role_color(span.role, palette))
-                                    .bg(palette.panel_bg);
-                                if span.bold {
-                                    style = style.add_modifier(Modifier::BOLD);
-                                }
-                                if span.italic {
-                                    style = style.add_modifier(Modifier::ITALIC);
-                                }
-                                Span::styled(span.text.as_str(), style)
-                            })
-                            .collect::<Vec<_>>(),
-                    )
+                .enumerate()
+                .map(|(line_index, line)| {
+                    let mut spans = Vec::new();
+                    if let Some(prefix) =
+                        line_number_prefix(document, line_index, state.show_line_numbers)
+                    {
+                        spans.push(Span::styled(
+                            prefix,
+                            Style::default().fg(palette.overlay0).bg(palette.panel_bg),
+                        ));
+                    }
+                    spans.extend(line.spans.iter().map(|span| {
+                        let mut style = Style::default()
+                            .fg(role_color(span.role, palette))
+                            .bg(palette.panel_bg);
+                        if span.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if span.italic {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
+                        Span::styled(span.text.as_str(), style)
+                    }));
+                    Line::from(spans)
                 })
                 .collect::<Vec<_>>();
             Paragraph::new(lines)
@@ -996,10 +1078,16 @@ fn render_preview_with_selection(
                     buffer,
                     area,
                     text,
-                    vertical,
-                    horizontal,
                     selection,
                     palette.surface1,
+                    SelectionRenderState {
+                        vertical,
+                        horizontal,
+                        line_number_gutter_width: line_number_gutter_width(
+                            document,
+                            state.show_line_numbers,
+                        ),
+                    },
                 );
             }
         }
@@ -1015,6 +1103,7 @@ fn handle_selection_mouse(
     area: Rect,
     vertical: usize,
     horizontal: usize,
+    show_line_numbers: bool,
     selection: &mut Option<TextSelection>,
 ) -> bool {
     let PreviewContent::Text(text) = &document.content else {
@@ -1029,7 +1118,8 @@ fn handle_selection_mouse(
             return None;
         }
         let line = vertical + usize::from(mouse.row - area.y);
-        let column = horizontal + usize::from(mouse.column - area.x);
+        let column = (horizontal + usize::from(mouse.column - area.x))
+            .saturating_sub(line_number_gutter_width(document, show_line_numbers));
         text_cell_boundaries(text, line, column)
     };
     match mouse.kind {
@@ -1139,14 +1229,13 @@ fn render_selection(
     buffer: &mut Buffer,
     area: Rect,
     text: &HighlightedText,
-    vertical: usize,
-    horizontal: usize,
     selection: TextSelection,
     background: Color,
+    state: SelectionRenderState,
 ) {
     let (start, end) = selection.ordered();
     for viewport_row in 0..usize::from(area.height) {
-        let line_index = vertical + viewport_row;
+        let line_index = state.vertical + viewport_row;
         if line_index < start.line || line_index > end.line {
             continue;
         }
@@ -1165,10 +1254,14 @@ fn render_selection(
         } else {
             length
         };
-        let display_start = display_width_to(&line, from);
-        let display_end = display_width_to(&line, to);
-        let viewport_start = horizontal;
-        let viewport_end = horizontal.saturating_add(usize::from(area.width));
+        let display_start = state
+            .line_number_gutter_width
+            .saturating_add(display_width_to(&line, from));
+        let display_end = state
+            .line_number_gutter_width
+            .saturating_add(display_width_to(&line, to));
+        let viewport_start = state.horizontal;
+        let viewport_end = state.horizontal.saturating_add(usize::from(area.width));
         for display_column in display_start.max(viewport_start)..display_end.min(viewport_end) {
             let x = area.x + u16::try_from(display_column - viewport_start).unwrap_or(u16::MAX);
             let y = area.y + u16::try_from(viewport_row).unwrap_or(u16::MAX);
@@ -1193,9 +1286,54 @@ fn max_vertical_scroll(document: &PreviewDocument, content_height: usize) -> usi
     }
 }
 
-fn max_horizontal_scroll(document: &PreviewDocument, content_width: usize) -> usize {
+fn line_number_gutter_width(document: &PreviewDocument, show_line_numbers: bool) -> usize {
+    if !show_line_numbers {
+        return 0;
+    }
+    document
+        .numbered_line_range
+        .as_ref()
+        .map(|range| {
+            range
+                .end
+                .saturating_sub(range.start)
+                .max(1)
+                .to_string()
+                .len()
+                .max(4)
+                + 2
+        })
+        .unwrap_or(0)
+}
+
+fn line_number_prefix(
+    document: &PreviewDocument,
+    line_index: usize,
+    show_line_numbers: bool,
+) -> Option<String> {
+    let range = document.numbered_line_range.as_ref()?;
+    if !show_line_numbers {
+        return None;
+    }
+    let number_width = line_number_gutter_width(document, true).saturating_sub(2);
+    let number = range
+        .contains(&line_index)
+        .then(|| line_index.saturating_sub(range.start).saturating_add(1))
+        .map(|number| number.to_string())
+        .unwrap_or_default();
+    Some(format!("{number:>number_width$}  "))
+}
+
+fn max_horizontal_scroll(
+    document: &PreviewDocument,
+    content_width: usize,
+    show_line_numbers: bool,
+) -> usize {
     match &document.content {
-        PreviewContent::Text(text) => text.width().saturating_sub(content_width),
+        PreviewContent::Text(text) => text
+            .width()
+            .saturating_add(line_number_gutter_width(document, show_line_numbers))
+            .saturating_sub(content_width),
         PreviewContent::Visual(_) => 0,
     }
 }
@@ -1368,8 +1506,10 @@ mod tests {
 
         let document = load_document(&invocation).expect("preview");
 
-        assert!(document.content.plain_text().contains("  12  line 12"));
+        assert!(document.content.plain_text().contains("line 12"));
+        assert!(!document.content.plain_text().contains("  12  line 12"));
         assert_eq!(document.initial_line, 8);
+        assert_eq!(document.numbered_line_range, Some(0..20));
         let escaping = PreviewInvocation {
             workspace: invocation.workspace,
             request: PreviewRequest::File {
@@ -1389,6 +1529,7 @@ mod tests {
             content: plain_content("first\nsecond\u{1b}[31m", HighlightRole::Text),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: None,
         };
 
         render_preview(&mut buffer, area, &document, 0, 0, &Palette::catppuccin());
@@ -1421,16 +1562,18 @@ mod tests {
             ),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: None,
         };
         let mut vertical = 0;
         let mut horizontal = 0;
         let mut visual_viewport = VisualViewport::default();
+        let horizontal_limit = max_horizontal_scroll(&document, 40, false);
         let mut key = |code, vertical: &mut usize, horizontal: &mut usize| {
             handle_preview_key(
                 crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
                 &mut document,
                 10,
-                40,
+                horizontal_limit,
                 vertical,
                 horizontal,
                 &mut visual_viewport,
@@ -1459,6 +1602,7 @@ mod tests {
             content: plain_content("alpha\nbeta", HighlightRole::Text),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: Some(0..2),
         };
         let mut selection = None;
         let area = Rect::new(0, 0, 10, 2);
@@ -1466,7 +1610,7 @@ mod tests {
         assert!(handle_selection_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 1,
+                column: 7,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             },
@@ -1474,12 +1618,13 @@ mod tests {
             area,
             0,
             0,
+            true,
             &mut selection,
         ));
         assert!(handle_selection_mouse(
             MouseEvent {
                 kind: MouseEventKind::Drag(MouseButton::Left),
-                column: 2,
+                column: 8,
                 row: 1,
                 modifiers: KeyModifiers::NONE,
             },
@@ -1487,6 +1632,7 @@ mod tests {
             area,
             0,
             0,
+            true,
             &mut selection,
         ));
 
@@ -1500,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn select_all_copies_exact_rendered_text_and_selection_preserves_syntax_color() {
+    fn line_numbers_default_off_toggle_without_changing_copy_or_selection() {
         let highlighted =
             HighlightedText::source(Path::new("main.rs"), "fn main() {}", false, false)
                 .expect("highlight");
@@ -1514,13 +1660,26 @@ mod tests {
             content: PreviewContent::Text(highlighted),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: Some(0..1),
         };
         let area = Rect::new(0, 0, 20, 1);
-        let mut buffer = Buffer::empty(area);
         let palette = Palette::catppuccin();
+        let mut default_buffer = Buffer::empty(area);
 
+        render_preview(&mut default_buffer, area, &document, 0, 0, &palette);
+        assert_eq!(default_buffer[(0, 0)].symbol(), "f");
+
+        let mut show_line_numbers = false;
+        assert!(handle_line_number_toggle(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &document,
+            &mut show_line_numbers,
+        ));
+        assert!(show_line_numbers);
+
+        let mut numbered_buffer = Buffer::empty(area);
         render_preview_with_selection(
-            &mut buffer,
+            &mut numbered_buffer,
             area,
             &document,
             0,
@@ -1529,11 +1688,22 @@ mod tests {
             PreviewRenderState {
                 selection: Some(selection),
                 visual_viewport: VisualViewport::default(),
+                show_line_numbers,
             },
         );
 
-        assert_eq!(buffer[(0, 0)].bg, palette.surface1);
-        assert_ne!(buffer[(0, 0)].fg, palette.surface1);
+        assert_eq!(numbered_buffer[(3, 0)].symbol(), "1");
+        assert_eq!(numbered_buffer[(6, 0)].symbol(), "f");
+        assert_ne!(numbered_buffer[(3, 0)].bg, palette.surface1);
+        assert_eq!(numbered_buffer[(6, 0)].bg, palette.surface1);
+        assert_ne!(numbered_buffer[(6, 0)].fg, palette.surface1);
+
+        assert!(handle_line_number_toggle(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &document,
+            &mut show_line_numbers,
+        ));
+        assert!(!show_line_numbers);
     }
 
     #[test]
@@ -1566,10 +1736,10 @@ mod tests {
 
     #[test]
     fn preview_help_renders_one_action_per_line() {
-        let area = Rect::new(0, 0, 60, 14);
+        let area = Rect::new(0, 0, 60, 15);
         let mut buffer = Buffer::empty(area);
 
-        render_preview_help(&mut buffer, area, &Palette::catppuccin(), false);
+        render_preview_help(&mut buffer, area, &Palette::catppuccin(), false, true);
 
         let rendered = (0..area.height)
             .map(|row| {
@@ -1583,8 +1753,9 @@ mod tests {
         assert!(rendered[2].contains("Cmd+A / Ctrl+A"));
         assert!(rendered[3].contains("Cmd+C / Ctrl+C"));
         assert!(rendered[4].trim_start().starts_with('y'));
-        assert!(rendered[12].trim_start().starts_with('?'));
-        assert!(rendered[13].contains("Cmd keys require terminal forwarding"));
+        assert!(rendered[5].contains("toggle line numbers"));
+        assert!(rendered[13].trim_start().starts_with('?'));
+        assert!(rendered[14].contains("Cmd keys require terminal forwarding"));
     }
 
     #[test]
@@ -1592,7 +1763,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 11);
         let mut buffer = Buffer::empty(area);
 
-        render_preview_help(&mut buffer, area, &Palette::catppuccin(), true);
+        render_preview_help(&mut buffer, area, &Palette::catppuccin(), true, false);
 
         let rendered = (0..area.height)
             .map(|row| {
@@ -1644,6 +1815,7 @@ mod tests {
             content: PreviewContent::Visual(VisualPreview::raster(pixels, 100, 100)),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: None,
         };
         let mut vertical = 0;
         let mut horizontal = 0;
@@ -1653,7 +1825,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
             &mut document,
             10,
-            20,
+            0,
             &mut vertical,
             &mut horizontal,
             &mut viewport,
@@ -1663,7 +1835,7 @@ mod tests {
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &mut document,
             10,
-            20,
+            0,
             &mut vertical,
             &mut horizontal,
             &mut viewport,
@@ -1672,7 +1844,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
             &mut document,
             10,
-            20,
+            0,
             &mut vertical,
             &mut horizontal,
             &mut viewport,
@@ -1686,7 +1858,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
             &mut document,
             10,
-            20,
+            0,
             &mut vertical,
             &mut horizontal,
             &mut viewport,
@@ -1704,6 +1876,7 @@ mod tests {
             content: PreviewContent::Visual(VisualPreview::raster(pixels, 1, 2)),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: None,
         };
         let area = Rect::new(0, 0, 1, 1);
         let mut buffer = Buffer::empty(area);
@@ -1727,6 +1900,7 @@ mod tests {
             content: PreviewContent::Text(highlighted),
             initial_line: 0,
             is_error: false,
+            numbered_line_range: None,
         };
         let area = Rect::new(0, 0, 40, 3);
         let mut buffer = Buffer::empty(area);

@@ -480,6 +480,7 @@ fn source_control_groups_and_popup_snapshot_matrix() {
         ),
         initial_line: 0,
         is_error: false,
+        numbered_line_range: None,
     };
     let untracked_document = PreviewDocument {
         title: "Untracked · new.rs".to_string(),
@@ -489,6 +490,7 @@ fn source_control_groups_and_popup_snapshot_matrix() {
         )),
         initial_line: 0,
         is_error: false,
+        numbered_line_range: None,
     };
     let output = format!(
         "== flat groups and dual membership ==\n{}\n\n== tree groups and dual membership ==\n{}\n\n== diff ==\n{}\n\n== untracked ==\n{}\n",

@@ -38,7 +38,7 @@ fn documentation_config_and_manifest_match_the_shipped_contract() {
         );
     }
     for required in [
-        "Version 1.0.1",
+        "Version 1.0.2",
         "Herdr 0.7.5 or newer",
         "herdr plugin install azizuysal/herdr-workbench",
         "herdr plugin list --plugin herdr-workbench",
@@ -72,6 +72,7 @@ fn documentation_config_and_manifest_match_the_shipped_contract() {
         "$EDITOR",
         "Finder or the Linux file manager",
         "Text previews support syntax highlighting",
+        "Line numbers are off by default",
         "Cmd+A",
         "Cmd+C",
         "Right click",
