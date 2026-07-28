@@ -300,7 +300,10 @@ impl SearchWalker<'_> {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            if self.ignored.matches(relative, metadata.is_dir()) && !self.query.include_ignored {
+            if is_git_metadata(relative)
+                || (!self.query.include_ignored
+                    && self.ignored.matches(relative, metadata.is_dir()))
+            {
                 continue;
             }
             entries.push((path, metadata));
@@ -519,12 +522,10 @@ impl IgnoreRules {
         }
     }
     fn matches(&self, path: &Path, directory: bool) -> bool {
-        if path == Path::new(".git")
-            || path.starts_with(".git")
-            || self
-                .exact
-                .iter()
-                .any(|ignored| path == ignored || path.starts_with(ignored))
+        if self
+            .exact
+            .iter()
+            .any(|ignored| path == ignored || path.starts_with(ignored))
         {
             return true;
         }
@@ -545,6 +546,11 @@ impl IgnoreRules {
             (direct || wildcard) && (!directory_only || directory)
         })
     }
+}
+
+fn is_git_metadata(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
 }
 
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {

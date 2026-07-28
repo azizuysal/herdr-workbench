@@ -2,14 +2,14 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.2](https://img.shields.io/badge/version-1.0.2-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.3](https://img.shields.io/badge/version-1.0.3-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)
 
 Explorer, live file and content search, read-only Source Control, and rich previews in one local-first, dockable terminal pane.
 
-![Herdr Workbench Explorer and centered preview](docs/screenshots/explorer-preview.png)
+![Herdr Workbench Explorer with colored file icons and Git decorations](docs/screenshots/explorer-preview.png)
 
 Herdr Workbench is a companion plugin for navigating and understanding a project without leaving Herdr. It stays out of the way when no other pane is open, remembers whether you prefer it on the left or right, and uses Herdr's active theme.
 

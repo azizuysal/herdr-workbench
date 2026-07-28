@@ -108,6 +108,8 @@ fn git_failure_retains_the_last_valid_snapshot_and_conflicts_remain_distinct() {
 fn search_is_sanitized_root_bound_and_respects_ignored_toggle() {
     let root = tempdir().unwrap();
     fs::write(root.path().join(".gitignore"), "/ignored/\n").unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(root.path().join(".git/private-log"), "needle").unwrap();
     fs::create_dir(root.path().join("ignored")).unwrap();
     fs::write(root.path().join("ignored/no.txt"), "needle").unwrap();
     fs::write(root.path().join("visible.txt"), "needle\x1b[31m\n").unwrap();
@@ -131,6 +133,12 @@ fn search_is_sanitized_root_bound_and_respects_ignored_toggle() {
         )
         .unwrap();
     assert_eq!(included.files.len(), 2);
+    assert!(
+        included
+            .files
+            .iter()
+            .all(|file| !file.path.starts_with(".git"))
+    );
 }
 
 #[test]
