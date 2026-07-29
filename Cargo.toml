@@ -1,6 +1,6 @@
 [package]
 name = "herdr-workbench"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A polished project sidebar for Herdr with Explorer, live file and content search, read-only Source Control, rich previews, file icons, and Git decorations."

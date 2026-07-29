@@ -29,7 +29,7 @@ use crate::{
     file_tree::{FileTree, Preview, sanitize_terminal},
     git::{GitStatusProvider, SourceControlGroup},
     herdr::{HerdrClient, LiveHerdr},
-    highlight::{HighlightRole, HighlightedText, label},
+    highlight::{HighlightLine, HighlightRole, HighlightedText, label},
     media::{self, VisualPreview},
     render::sanitize_multiline,
     theme::{self, Palette},
@@ -226,8 +226,15 @@ struct PreviewRenderState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SelectionRenderState {
     vertical: usize,
-    horizontal: usize,
     line_number_gutter_width: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrappedTextLine {
+    source_line: usize,
+    start_column: usize,
+    end_column: usize,
+    first_visual_line: bool,
 }
 
 impl VisualViewport {
@@ -586,8 +593,8 @@ fn terminal_loop(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let mut vertical = document.initial_line;
-    let mut horizontal = 0_usize;
+    let mut vertical = 0_usize;
+    let mut initial_line = Some(document.initial_line);
     let mut selection = None;
     let mut visual_viewport = VisualViewport::default();
     let mut help_visible = false;
@@ -602,9 +609,17 @@ fn terminal_loop(
                 let area = frame.area();
                 content_width = usize::from(area.width);
                 content_height = usize::from(area.height).max(1);
-                vertical = vertical.min(max_vertical_scroll(&document, content_height));
-                horizontal = horizontal.min(max_horizontal_scroll(
+                if let Some(source_line) = initial_line.take() {
+                    vertical = wrapped_row_for_source_line(
+                        &document,
+                        content_width,
+                        show_line_numbers,
+                        source_line,
+                    );
+                }
+                vertical = vertical.min(max_vertical_scroll(
                     &document,
+                    content_height,
                     content_width,
                     show_line_numbers,
                 ));
@@ -622,7 +637,6 @@ fn terminal_loop(
                         area,
                         &document,
                         vertical,
-                        horizontal,
                         &resolved_theme.palette,
                         PreviewRenderState {
                             selection,
@@ -674,7 +688,6 @@ fn terminal_loop(
                             document = PreviewDocument::error(document.title.clone(), error);
                             selection = None;
                             vertical = 0;
-                            horizontal = 0;
                         }
                         dirty = true;
                         continue;
@@ -699,7 +712,6 @@ fn terminal_loop(
                         if let Err(error) = result {
                             document = PreviewDocument::error(document.title.clone(), error);
                             vertical = 0;
-                            horizontal = 0;
                             visual_viewport.reset();
                         }
                         dirty = true;
@@ -709,15 +721,18 @@ fn terminal_loop(
                         dirty = true;
                         continue;
                     }
-                    let horizontal_limit =
-                        max_horizontal_scroll(&document, content_width, show_line_numbers);
+                    let vertical_limit = max_vertical_scroll(
+                        &document,
+                        content_height,
+                        content_width,
+                        show_line_numbers,
+                    );
                     if handle_preview_key(
                         key,
                         &mut document,
                         content_height,
-                        horizontal_limit,
+                        vertical_limit,
                         &mut vertical,
-                        &mut horizontal,
                         &mut visual_viewport,
                     ) {
                         return Ok(());
@@ -731,7 +746,6 @@ fn terminal_loop(
                         &document,
                         area,
                         vertical,
-                        horizontal,
                         show_line_numbers,
                         &mut selection,
                     ) {
@@ -755,9 +769,12 @@ fn terminal_loop(
                             {
                                 visual_viewport.pan(0, VISUAL_WHEEL_STEP);
                             } else if !move_pdf_page(&mut document, 1) {
-                                vertical = vertical
-                                    .saturating_add(3)
-                                    .min(max_vertical_scroll(&document, content_height));
+                                vertical = vertical.saturating_add(3).min(max_vertical_scroll(
+                                    &document,
+                                    content_height,
+                                    content_width,
+                                    show_line_numbers,
+                                ));
                             }
                             dirty = true;
                         }
@@ -793,9 +810,8 @@ fn handle_preview_key(
     key: KeyEvent,
     document: &mut PreviewDocument,
     content_height: usize,
-    horizontal_limit: usize,
+    vertical_limit: usize,
     vertical: &mut usize,
-    horizontal: &mut usize,
     visual_viewport: &mut VisualViewport,
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
@@ -842,22 +858,14 @@ fn handle_preview_key(
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => *vertical = vertical.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
-            *vertical = vertical
-                .saturating_add(1)
-                .min(max_vertical_scroll(document, content_height));
+            *vertical = vertical.saturating_add(1).min(vertical_limit);
         }
         KeyCode::PageUp => *vertical = vertical.saturating_sub(content_height),
         KeyCode::PageDown => {
-            *vertical = vertical
-                .saturating_add(content_height)
-                .min(max_vertical_scroll(document, content_height));
+            *vertical = vertical.saturating_add(content_height).min(vertical_limit);
         }
         KeyCode::Home => *vertical = 0,
-        KeyCode::End => *vertical = max_vertical_scroll(document, content_height),
-        KeyCode::Left | KeyCode::Char('h') => *horizontal = horizontal.saturating_sub(4),
-        KeyCode::Right | KeyCode::Char('l') => {
-            *horizontal = horizontal.saturating_add(4).min(horizontal_limit);
-        }
+        KeyCode::End => *vertical = vertical_limit,
         _ => {}
     }
     false
@@ -919,7 +927,7 @@ pub fn render_preview(
     area: Rect,
     document: &PreviewDocument,
     vertical: usize,
-    horizontal: usize,
+    _horizontal: usize,
     palette: &Palette,
 ) {
     render_preview_with_selection(
@@ -927,7 +935,6 @@ pub fn render_preview(
         area,
         document,
         vertical,
-        horizontal,
         palette,
         PreviewRenderState::default(),
     );
@@ -989,7 +996,6 @@ fn render_preview_help(
             shortcut("Up/Down or j/k", "scroll vertically"),
             shortcut("PgUp/PgDn", "scroll by page"),
             shortcut("Home/End", "first / last line"),
-            shortcut("Left/Right or h/l", "scroll horizontally"),
             shortcut("Mouse wheel", "scroll vertically"),
             shortcut("Esc", "clear selection / close"),
             shortcut("Space or q", "close preview"),
@@ -1017,7 +1023,6 @@ fn render_preview_with_selection(
     area: Rect,
     document: &PreviewDocument,
     vertical: usize,
-    horizontal: usize,
     palette: &Palette,
     state: PreviewRenderState,
 ) {
@@ -1029,32 +1034,37 @@ fn render_preview_with_selection(
     }
     match &document.content {
         PreviewContent::Text(text) => {
-            let lines = text
-                .lines
+            let gutter_width = effective_line_number_gutter_width(
+                document,
+                state.show_line_numbers,
+                usize::from(area.width),
+            );
+            let wrapped_lines = wrapped_text_layout(
+                text,
+                usize::from(area.width).saturating_sub(gutter_width).max(1),
+            );
+            let lines = wrapped_lines
                 .iter()
-                .enumerate()
-                .map(|(line_index, line)| {
+                .map(|wrapped| {
                     let mut spans = Vec::new();
-                    if let Some(prefix) =
-                        line_number_prefix(document, line_index, state.show_line_numbers)
-                    {
+                    if let Some(prefix) = line_number_prefix(
+                        document,
+                        wrapped.source_line,
+                        state.show_line_numbers,
+                        wrapped.first_visual_line,
+                        gutter_width,
+                    ) {
                         spans.push(Span::styled(
                             prefix,
                             Style::default().fg(palette.overlay0).bg(palette.panel_bg),
                         ));
                     }
-                    spans.extend(line.spans.iter().map(|span| {
-                        let mut style = Style::default()
-                            .fg(role_color(span.role, palette))
-                            .bg(palette.panel_bg);
-                        if span.bold {
-                            style = style.add_modifier(Modifier::BOLD);
-                        }
-                        if span.italic {
-                            style = style.add_modifier(Modifier::ITALIC);
-                        }
-                        Span::styled(span.text.as_str(), style)
-                    }));
+                    spans.extend(highlighted_spans(
+                        &text.lines[wrapped.source_line],
+                        wrapped.start_column,
+                        wrapped.end_column,
+                        palette,
+                    ));
                     Line::from(spans)
                 })
                 .collect::<Vec<_>>();
@@ -1068,25 +1078,19 @@ fn render_preview_with_selection(
                         })
                         .bg(palette.panel_bg),
                 )
-                .scroll((
-                    u16::try_from(vertical).unwrap_or(u16::MAX),
-                    u16::try_from(horizontal).unwrap_or(u16::MAX),
-                ))
+                .scroll((u16::try_from(vertical).unwrap_or(u16::MAX), 0))
                 .render(area, buffer);
             if let Some(selection) = state.selection {
                 render_selection(
                     buffer,
                     area,
                     text,
+                    &wrapped_lines,
                     selection,
                     palette.surface1,
                     SelectionRenderState {
                         vertical,
-                        horizontal,
-                        line_number_gutter_width: line_number_gutter_width(
-                            document,
-                            state.show_line_numbers,
-                        ),
+                        line_number_gutter_width: gutter_width,
                     },
                 );
             }
@@ -1102,13 +1106,18 @@ fn handle_selection_mouse(
     document: &PreviewDocument,
     area: Rect,
     vertical: usize,
-    horizontal: usize,
     show_line_numbers: bool,
     selection: &mut Option<TextSelection>,
 ) -> bool {
     let PreviewContent::Text(text) = &document.content else {
         return false;
     };
+    let gutter_width =
+        effective_line_number_gutter_width(document, show_line_numbers, usize::from(area.width));
+    let wrapped_lines = wrapped_text_layout(
+        text,
+        usize::from(area.width).saturating_sub(gutter_width).max(1),
+    );
     let selection_cell = || {
         if mouse.column < area.x
             || mouse.column >= area.x.saturating_add(area.width)
@@ -1117,10 +1126,15 @@ fn handle_selection_mouse(
         {
             return None;
         }
-        let line = vertical + usize::from(mouse.row - area.y);
-        let column = (horizontal + usize::from(mouse.column - area.x))
-            .saturating_sub(line_number_gutter_width(document, show_line_numbers));
-        text_cell_boundaries(text, line, column)
+        let wrapped = wrapped_lines.get(vertical + usize::from(mouse.row - area.y))?;
+        let column = usize::from(mouse.column - area.x).saturating_sub(gutter_width);
+        text_cell_boundaries(
+            text,
+            wrapped.source_line,
+            wrapped.start_column,
+            wrapped.end_column,
+            column,
+        )
     };
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1154,16 +1168,23 @@ fn handle_selection_mouse(
 fn text_cell_boundaries(
     text: &HighlightedText,
     line: usize,
+    start_column: usize,
+    end_column: usize,
     display_column: usize,
 ) -> Option<(TextPosition, TextPosition)> {
     let line_text = text.lines.get(line)?.plain_text();
     let characters = line_text.chars().collect::<Vec<_>>();
     let mut display = 0_usize;
-    for (index, character) in characters.iter().enumerate() {
+    for (index, character) in characters
+        .iter()
+        .enumerate()
+        .take(end_column)
+        .skip(start_column)
+    {
         let width = UnicodeWidthChar::width(*character).unwrap_or(0);
         if width > 0 && display_column < display.saturating_add(width) {
             let mut end = index + 1;
-            while end < characters.len()
+            while end < end_column.min(characters.len())
                 && UnicodeWidthChar::width(characters[end]).unwrap_or(0) == 0
             {
                 end += 1;
@@ -1180,7 +1201,7 @@ fn text_cell_boundaries(
     }
     let end = TextPosition {
         line,
-        column: characters.len(),
+        column: end_column.min(characters.len()),
     };
     Some((end, end))
 }
@@ -1229,13 +1250,17 @@ fn render_selection(
     buffer: &mut Buffer,
     area: Rect,
     text: &HighlightedText,
+    wrapped_lines: &[WrappedTextLine],
     selection: TextSelection,
     background: Color,
     state: SelectionRenderState,
 ) {
     let (start, end) = selection.ordered();
     for viewport_row in 0..usize::from(area.height) {
-        let line_index = state.vertical + viewport_row;
+        let Some(wrapped) = wrapped_lines.get(state.vertical + viewport_row) else {
+            break;
+        };
+        let line_index = wrapped.source_line;
         if line_index < start.line || line_index > end.line {
             continue;
         }
@@ -1244,26 +1269,29 @@ fn render_selection(
         };
         let line = line.plain_text();
         let length = line.chars().count();
-        let from = if line_index == start.line {
+        let selection_from = if line_index == start.line {
             start.column.min(length)
         } else {
             0
         };
-        let to = if line_index == end.line {
+        let selection_to = if line_index == end.line {
             end.column.min(length)
         } else {
             length
         };
+        let from = selection_from.max(wrapped.start_column);
+        let to = selection_to.min(wrapped.end_column);
+        if from >= to {
+            continue;
+        }
         let display_start = state
             .line_number_gutter_width
-            .saturating_add(display_width_to(&line, from));
+            .saturating_add(display_width_between(&line, wrapped.start_column, from));
         let display_end = state
             .line_number_gutter_width
-            .saturating_add(display_width_to(&line, to));
-        let viewport_start = state.horizontal;
-        let viewport_end = state.horizontal.saturating_add(usize::from(area.width));
-        for display_column in display_start.max(viewport_start)..display_end.min(viewport_end) {
-            let x = area.x + u16::try_from(display_column - viewport_start).unwrap_or(u16::MAX);
+            .saturating_add(display_width_between(&line, wrapped.start_column, to));
+        for display_column in display_start..display_end.min(usize::from(area.width)) {
+            let x = area.x + u16::try_from(display_column).unwrap_or(u16::MAX);
             let y = area.y + u16::try_from(viewport_row).unwrap_or(u16::MAX);
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.set_bg(background);
@@ -1272,16 +1300,28 @@ fn render_selection(
     }
 }
 
-fn display_width_to(text: &str, character_count: usize) -> usize {
+fn display_width_between(text: &str, start: usize, end: usize) -> usize {
     text.chars()
-        .take(character_count)
+        .skip(start)
+        .take(end.saturating_sub(start))
         .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
         .sum()
 }
 
-fn max_vertical_scroll(document: &PreviewDocument, content_height: usize) -> usize {
+fn max_vertical_scroll(
+    document: &PreviewDocument,
+    content_height: usize,
+    content_width: usize,
+    show_line_numbers: bool,
+) -> usize {
     match &document.content {
-        PreviewContent::Text(text) => text.lines.len().max(1).saturating_sub(content_height),
+        PreviewContent::Text(text) => wrapped_text_layout(
+            text,
+            wrapped_content_width(document, content_width, show_line_numbers),
+        )
+        .len()
+        .max(1)
+        .saturating_sub(content_height),
         PreviewContent::Visual(_) => 0,
     }
 }
@@ -1306,36 +1346,155 @@ fn line_number_gutter_width(document: &PreviewDocument, show_line_numbers: bool)
         .unwrap_or(0)
 }
 
-fn line_number_prefix(
+fn effective_line_number_gutter_width(
     document: &PreviewDocument,
-    line_index: usize,
     show_line_numbers: bool,
-) -> Option<String> {
-    let range = document.numbered_line_range.as_ref()?;
-    if !show_line_numbers {
-        return None;
-    }
-    let number_width = line_number_gutter_width(document, true).saturating_sub(2);
-    let number = range
-        .contains(&line_index)
-        .then(|| line_index.saturating_sub(range.start).saturating_add(1))
-        .map(|number| number.to_string())
-        .unwrap_or_default();
-    Some(format!("{number:>number_width$}  "))
+    content_width: usize,
+) -> usize {
+    line_number_gutter_width(document, show_line_numbers).min(content_width.saturating_sub(1))
 }
 
-fn max_horizontal_scroll(
+fn wrapped_content_width(
     document: &PreviewDocument,
     content_width: usize,
     show_line_numbers: bool,
 ) -> usize {
-    match &document.content {
-        PreviewContent::Text(text) => text
-            .width()
-            .saturating_add(line_number_gutter_width(document, show_line_numbers))
-            .saturating_sub(content_width),
-        PreviewContent::Visual(_) => 0,
+    content_width
+        .saturating_sub(effective_line_number_gutter_width(
+            document,
+            show_line_numbers,
+            content_width,
+        ))
+        .max(1)
+}
+
+fn line_number_prefix(
+    document: &PreviewDocument,
+    line_index: usize,
+    show_line_numbers: bool,
+    first_visual_line: bool,
+    gutter_width: usize,
+) -> Option<String> {
+    let range = document.numbered_line_range.as_ref()?;
+    if !show_line_numbers || gutter_width == 0 {
+        return None;
     }
+    let number_width = gutter_width.saturating_sub(2);
+    let number = (first_visual_line && range.contains(&line_index))
+        .then(|| line_index.saturating_sub(range.start).saturating_add(1))
+        .map(|number| number.to_string())
+        .unwrap_or_default();
+    if gutter_width < 3 || number.len() > number_width {
+        return Some(" ".repeat(gutter_width));
+    }
+    Some(format!("{number:>number_width$}  "))
+}
+
+fn wrapped_row_for_source_line(
+    document: &PreviewDocument,
+    content_width: usize,
+    show_line_numbers: bool,
+    source_line: usize,
+) -> usize {
+    let PreviewContent::Text(text) = &document.content else {
+        return 0;
+    };
+    wrapped_text_layout(
+        text,
+        wrapped_content_width(document, content_width, show_line_numbers),
+    )
+    .iter()
+    .position(|line| line.source_line >= source_line)
+    .unwrap_or(0)
+}
+
+fn wrapped_text_layout(text: &HighlightedText, content_width: usize) -> Vec<WrappedTextLine> {
+    let content_width = content_width.max(1);
+    let mut wrapped = Vec::new();
+    for (source_line, line) in text.lines.iter().enumerate() {
+        let plain = line.plain_text();
+        let characters = plain.chars().collect::<Vec<_>>();
+        if characters.is_empty() {
+            wrapped.push(WrappedTextLine {
+                source_line,
+                start_column: 0,
+                end_column: 0,
+                first_visual_line: true,
+            });
+            continue;
+        }
+        let mut start_column = 0;
+        while start_column < characters.len() {
+            let mut end_column = start_column;
+            let mut line_width = 0_usize;
+            let mut last_whitespace = None;
+            while end_column < characters.len() {
+                let character = characters[end_column];
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if line_width > 0 && line_width.saturating_add(character_width) > content_width {
+                    break;
+                }
+                line_width = line_width.saturating_add(character_width);
+                end_column += 1;
+                if character.is_whitespace() {
+                    last_whitespace = Some(end_column);
+                }
+            }
+            if end_column < characters.len()
+                && let Some(whitespace_end) = last_whitespace
+                && whitespace_end > start_column
+                && characters[start_column..whitespace_end]
+                    .iter()
+                    .any(|character| !character.is_whitespace())
+            {
+                end_column = whitespace_end;
+            }
+            wrapped.push(WrappedTextLine {
+                source_line,
+                start_column,
+                end_column,
+                first_visual_line: start_column == 0,
+            });
+            start_column = end_column;
+        }
+    }
+    wrapped
+}
+
+fn highlighted_spans(
+    line: &HighlightLine,
+    start_column: usize,
+    end_column: usize,
+    palette: &Palette,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut span_start = 0_usize;
+    for span in &line.spans {
+        let span_length = span.text.chars().count();
+        let span_end = span_start.saturating_add(span_length);
+        let from = start_column.max(span_start);
+        let to = end_column.min(span_end);
+        if from < to {
+            let text = span
+                .text
+                .chars()
+                .skip(from - span_start)
+                .take(to - from)
+                .collect::<String>();
+            let mut style = Style::default()
+                .fg(role_color(span.role, palette))
+                .bg(palette.panel_bg);
+            if span.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if span.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            spans.push(Span::styled(text, style));
+        }
+        span_start = span_end;
+    }
+    spans
 }
 
 fn role_color(role: HighlightRole, palette: &Palette) -> Color {
@@ -1565,34 +1724,122 @@ mod tests {
             numbered_line_range: None,
         };
         let mut vertical = 0;
-        let mut horizontal = 0;
         let mut visual_viewport = VisualViewport::default();
-        let horizontal_limit = max_horizontal_scroll(&document, 40, false);
-        let mut key = |code, vertical: &mut usize, horizontal: &mut usize| {
+        let vertical_limit = max_vertical_scroll(&document, 10, 40, false);
+        let mut key = |code, vertical: &mut usize| {
             handle_preview_key(
                 crossterm::event::KeyEvent::new(code, KeyModifiers::NONE),
                 &mut document,
                 10,
-                horizontal_limit,
+                vertical_limit,
                 vertical,
-                horizontal,
                 &mut visual_viewport,
             )
         };
 
-        assert!(!key(KeyCode::Down, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::Down, &mut vertical));
         assert_eq!(vertical, 1);
-        assert!(!key(KeyCode::PageDown, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::PageDown, &mut vertical));
         assert_eq!(vertical, 11);
-        assert!(!key(KeyCode::PageUp, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::PageUp, &mut vertical));
         assert_eq!(vertical, 1);
-        assert!(!key(KeyCode::End, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::End, &mut vertical));
         assert_eq!(vertical, 90);
-        assert!(!key(KeyCode::Home, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::Home, &mut vertical));
         assert_eq!(vertical, 0);
-        assert!(!key(KeyCode::Up, &mut vertical, &mut horizontal));
+        assert!(!key(KeyCode::Up, &mut vertical));
         assert_eq!(vertical, 0);
-        assert!(key(KeyCode::Esc, &mut vertical, &mut horizontal));
+        assert!(key(KeyCode::Esc, &mut vertical));
+    }
+
+    #[test]
+    fn long_lines_soft_wrap_without_changing_select_all_text() {
+        let source = format!("{}complete", "x".repeat(24));
+        let highlighted = HighlightedText::plain(&source, HighlightRole::Text);
+        let selection = select_all(&highlighted).expect("non-empty selection");
+        let document = PreviewDocument {
+            title: "long.txt".to_string(),
+            content: PreviewContent::Text(highlighted),
+            initial_line: 0,
+            is_error: false,
+            numbered_line_range: Some(0..1),
+        };
+        let area = Rect::new(0, 0, 10, 4);
+        let mut buffer = Buffer::empty(area);
+
+        render_preview(&mut buffer, area, &document, 0, 0, &Palette::catppuccin());
+
+        let rendered = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], "xxxxxxxxxx");
+        assert_eq!(rendered[1], "xxxxxxxxxx");
+        assert_eq!(rendered[2], "xxxxcomple");
+        assert_eq!(rendered[3].trim_end(), "te");
+        let PreviewContent::Text(text) = &document.content else {
+            panic!("text preview");
+        };
+        assert_eq!(selected_text(text, selection), Some(source));
+        assert_eq!(max_vertical_scroll(&document, 2, 10, false), 2);
+    }
+
+    #[test]
+    fn prose_wraps_at_whitespace_and_numbers_only_the_first_visual_row() {
+        let document = PreviewDocument {
+            title: "notes.txt".to_string(),
+            content: plain_content("alpha beta", HighlightRole::Text),
+            initial_line: 0,
+            is_error: false,
+            numbered_line_range: Some(0..1),
+        };
+        let area = Rect::new(0, 0, 13, 2);
+        let palette = Palette::catppuccin();
+        let mut buffer = Buffer::empty(area);
+
+        render_preview_with_selection(
+            &mut buffer,
+            area,
+            &document,
+            0,
+            &palette,
+            PreviewRenderState {
+                selection: None,
+                visual_viewport: VisualViewport::default(),
+                show_line_numbers: true,
+            },
+        );
+
+        assert_eq!(buffer[(3, 0)].symbol(), "1");
+        assert_eq!(buffer[(3, 1)].symbol(), " ");
+        assert_eq!(buffer[(6, 0)].symbol(), "a");
+        assert_eq!(buffer[(6, 1)].symbol(), "b");
+        assert_eq!(
+            wrapped_text_layout(
+                match &document.content {
+                    PreviewContent::Text(text) => text,
+                    PreviewContent::Visual(_) => panic!("text preview"),
+                },
+                7,
+            ),
+            vec![
+                WrappedTextLine {
+                    source_line: 0,
+                    start_column: 0,
+                    end_column: 6,
+                    first_visual_line: true,
+                },
+                WrappedTextLine {
+                    source_line: 0,
+                    start_column: 6,
+                    end_column: 10,
+                    first_visual_line: false,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1605,7 +1852,7 @@ mod tests {
             numbered_line_range: Some(0..2),
         };
         let mut selection = None;
-        let area = Rect::new(0, 0, 10, 2);
+        let area = Rect::new(0, 0, 16, 2);
 
         assert!(handle_selection_mouse(
             MouseEvent {
@@ -1616,7 +1863,6 @@ mod tests {
             },
             &document,
             area,
-            0,
             0,
             true,
             &mut selection,
@@ -1631,7 +1877,6 @@ mod tests {
             &document,
             area,
             0,
-            0,
             true,
             &mut selection,
         ));
@@ -1642,6 +1887,54 @@ mod tests {
         assert_eq!(
             selection.and_then(|selection| selected_text(text, selection)),
             Some("lpha\nbet".to_string())
+        );
+    }
+
+    #[test]
+    fn mouse_drag_selection_maps_wrapped_rows_back_to_source_text() {
+        let document = PreviewDocument {
+            title: "notes.txt".to_string(),
+            content: plain_content("abcdefghij", HighlightRole::Text),
+            initial_line: 0,
+            is_error: false,
+            numbered_line_range: None,
+        };
+        let mut selection = None;
+        let area = Rect::new(0, 0, 4, 3);
+
+        assert!(handle_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &document,
+            area,
+            0,
+            false,
+            &mut selection,
+        ));
+        assert!(handle_selection_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &document,
+            area,
+            0,
+            false,
+            &mut selection,
+        ));
+
+        let PreviewContent::Text(text) = &document.content else {
+            panic!("text preview");
+        };
+        assert_eq!(
+            selection.and_then(|selection| selected_text(text, selection)),
+            Some("bcdefghij".to_string())
         );
     }
 
@@ -1682,7 +1975,6 @@ mod tests {
             &mut numbered_buffer,
             area,
             &document,
-            0,
             0,
             &palette,
             PreviewRenderState {
@@ -1754,8 +2046,8 @@ mod tests {
         assert!(rendered[3].contains("Cmd+C / Ctrl+C"));
         assert!(rendered[4].trim_start().starts_with('y'));
         assert!(rendered[5].contains("toggle line numbers"));
-        assert!(rendered[13].trim_start().starts_with('?'));
-        assert!(rendered[14].contains("Cmd keys require terminal forwarding"));
+        assert!(rendered[12].trim_start().starts_with('?'));
+        assert!(rendered[13].contains("Cmd keys require terminal forwarding"));
     }
 
     #[test]
@@ -1818,7 +2110,6 @@ mod tests {
             numbered_line_range: None,
         };
         let mut vertical = 0;
-        let mut horizontal = 0;
         let mut viewport = VisualViewport::default();
 
         assert!(!handle_preview_key(
@@ -1827,7 +2118,6 @@ mod tests {
             10,
             0,
             &mut vertical,
-            &mut horizontal,
             &mut viewport,
         ));
         assert_eq!(viewport.zoom, 1);
@@ -1837,7 +2127,6 @@ mod tests {
             10,
             0,
             &mut vertical,
-            &mut horizontal,
             &mut viewport,
         ));
         assert!(!handle_preview_key(
@@ -1846,21 +2135,19 @@ mod tests {
             10,
             0,
             &mut vertical,
-            &mut horizontal,
             &mut viewport,
         ));
         assert_eq!(
             (viewport.pan_x, viewport.pan_y),
             (VISUAL_PAN_STEP, VISUAL_PAN_STEP)
         );
-        assert_eq!((vertical, horizontal), (0, 0));
+        assert_eq!(vertical, 0);
         assert!(!handle_preview_key(
             KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
             &mut document,
             10,
             0,
             &mut vertical,
-            &mut horizontal,
             &mut viewport,
         ));
         assert_eq!(viewport, VisualViewport::default());

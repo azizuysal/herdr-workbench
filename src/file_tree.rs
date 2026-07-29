@@ -7,7 +7,6 @@ use crate::workspace::{WorkspaceError, WorkspaceRoot};
 
 const PREVIEW_BYTE_LIMIT: usize = 64 * 1024;
 const PREVIEW_LINE_LIMIT: usize = 1_000;
-const PREVIEW_LINE_WIDTH: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -424,9 +423,8 @@ pub fn sanitized_preview(path: &Path) -> Result<Preview, FileTreeError> {
     let mut source_lines = Vec::new();
     for (index, line) in text.lines().take(PREVIEW_LINE_LIMIT).enumerate() {
         let sanitized = sanitize_terminal(line);
-        let clipped = truncate_chars(&sanitized, PREVIEW_LINE_WIDTH);
-        source_lines.push(clipped.clone());
-        lines.push(format!("{:>4}  {clipped}", index + 1));
+        source_lines.push(sanitized.clone());
+        lines.push(format!("{:>4}  {sanitized}", index + 1));
     }
     let line_truncated = text.lines().count() > PREVIEW_LINE_LIMIT;
     if truncated || line_truncated {
@@ -454,11 +452,4 @@ pub fn sanitize_terminal(value: &str) -> String {
             character => vec![character],
         })
         .collect()
-}
-fn truncate_chars(value: &str, maximum: usize) -> String {
-    let mut output: String = value.chars().take(maximum).collect();
-    if value.chars().count() > maximum {
-        output.push('…');
-    }
-    output
 }

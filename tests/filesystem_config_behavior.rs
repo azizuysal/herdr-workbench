@@ -127,6 +127,8 @@ fn state_round_trips_atomically_and_corruption_requires_explicit_reset() {
 #[test]
 fn root_bound_tree_is_lazy_sorted_and_sanitizes_preview() {
     let fixture = fixture();
+    let long_line = format!("{}complete", "x".repeat(300));
+    fs::write(fixture.path().join("long.txt"), &long_line).unwrap();
     let workspace = WorkspaceRoot::resolve(fixture.path()).unwrap();
     let mut tree = FileTree::new(workspace.clone(), true, false);
     assert_eq!(tree.visit_count(), 0);
@@ -155,6 +157,16 @@ fn root_bound_tree_is_lazy_sorted_and_sanitizes_preview() {
             assert!(rendered.contains("   1  safe\\x1b[31mtext"));
         }
         Preview::Binary { .. } => panic!("text fixture was classified as binary"),
+    }
+    match tree.preview(Path::new("long.txt")).unwrap() {
+        Preview::Text {
+            source, truncated, ..
+        } => {
+            assert_eq!(source, long_line);
+            assert!(!truncated);
+            assert!(!source.contains('…'));
+        }
+        Preview::Binary { .. } => panic!("long text fixture was classified as binary"),
     }
     assert!(matches!(
         tree.preview(Path::new("binary.bin")).unwrap(),
