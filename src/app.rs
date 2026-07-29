@@ -224,7 +224,7 @@ struct ExplorerItem {
 
 #[derive(Debug, Clone)]
 enum SourceItem {
-    Header(SourceControlGroup, usize),
+    Header(SourceControlGroup, usize, bool),
     Directory {
         group: SourceControlGroup,
         path: PathBuf,
@@ -282,6 +282,7 @@ struct SidebarApp {
     git_view_mode: GitViewMode,
     git_tree_expanded: BTreeSet<String>,
     git_tree_initialized: bool,
+    git_collapsed_groups: BTreeSet<String>,
     selection: usize,
     offset: usize,
     viewport_rows: usize,
@@ -400,6 +401,7 @@ impl SidebarApp {
             git_view_mode: saved.git_view_mode,
             git_tree_expanded: saved.git_tree_expanded.clone(),
             git_tree_initialized: saved.git_tree_initialized,
+            git_collapsed_groups: saved.git_collapsed_groups.clone(),
             selection,
             offset: saved.scroll,
             viewport_rows: 1,
@@ -607,7 +609,11 @@ impl SidebarApp {
             if entries.is_empty() && !self.config.show_empty_git_groups {
                 continue;
             }
-            items.push(SourceItem::Header(group, entries.len()));
+            let expanded = !self.git_collapsed_groups.contains(source_group_key(group));
+            items.push(SourceItem::Header(group, entries.len(), expanded));
+            if !expanded {
+                continue;
+            }
             match self.git_view_mode {
                 GitViewMode::Flat => {
                     items.extend(entries.into_iter().cloned().map(|entry| SourceItem::Entry {
@@ -635,12 +641,12 @@ impl SidebarApp {
             .into_iter()
             .enumerate()
             .map(|(index, item)| match item {
-                SourceItem::Header(group, count) => RenderRow {
+                SourceItem::Header(group, count, expanded) => RenderRow {
                     name: format!("{} ({count})", group_label(group)),
                     path: String::new(),
                     kind: EntryKind::Directory,
                     git: GitCoordinates::default(),
-                    expanded: true,
+                    expanded,
                     depth: 0,
                     selected: index == self.selection,
                     focused: index == self.selection,
@@ -953,7 +959,16 @@ impl SidebarApp {
                 self.preview_selected_source();
                 false
             }
-            Some(SourceItem::Header(_, _)) | None => false,
+            Some(SourceItem::Header(group, _, expanded)) => {
+                if expanded {
+                    self.git_collapsed_groups
+                        .insert(source_group_key(group).to_string());
+                } else {
+                    self.git_collapsed_groups.remove(source_group_key(group));
+                }
+                true
+            }
+            None => false,
         };
         if changed {
             self.persist_source_preferences();
@@ -1009,7 +1024,7 @@ impl SidebarApp {
 
     fn selected_source(&self) -> Option<SourceSelection> {
         match self.source_items().get(self.selection)? {
-            SourceItem::Header(group, _) => Some(SourceSelection::Header(*group)),
+            SourceItem::Header(group, _, _) => Some(SourceSelection::Header(*group)),
             SourceItem::Directory { group, path, .. } => {
                 Some(SourceSelection::Path(*group, path.clone()))
             }
@@ -1023,7 +1038,7 @@ impl SidebarApp {
         let items = self.source_items();
         let exact = selected.as_ref().and_then(|selected| {
             items.iter().position(|item| match (selected, item) {
-                (SourceSelection::Header(expected), SourceItem::Header(actual, _)) => {
+                (SourceSelection::Header(expected), SourceItem::Header(actual, _, _)) => {
                     expected == actual
                 }
                 (
@@ -1041,22 +1056,28 @@ impl SidebarApp {
             let group = match selected {
                 SourceSelection::Header(group) | SourceSelection::Path(group, _) => group,
             };
-            items
-                .iter()
-                .position(|item| matches!(item, SourceItem::Header(actual, _) if *actual == group))
+            items.iter().position(
+                |item| matches!(item, SourceItem::Header(actual, _, _) if *actual == group),
+            )
         });
         self.selection = exact.or(group_fallback).unwrap_or(0);
         self.keep_selection_visible();
     }
 
     fn collapse_or_source_parent(&mut self) {
-        if self.git_view_mode != GitViewMode::Tree {
-            return;
-        }
         let items = self.source_items();
         let Some(item) = items.get(self.selection).cloned() else {
             return;
         };
+        if let SourceItem::Header(group, _, true) = item {
+            self.git_collapsed_groups
+                .insert(source_group_key(group).to_string());
+            self.persist_source_preferences();
+            return;
+        }
+        if self.git_view_mode != GitViewMode::Tree {
+            return;
+        }
         if let SourceItem::Directory {
             group,
             path,
@@ -1072,13 +1093,15 @@ impl SidebarApp {
         let (group, path) = match item {
             SourceItem::Directory { group, path, .. } => (group, path),
             SourceItem::Entry { group, entry, .. } => (group, entry.path.clone()),
-            SourceItem::Header(_, _) => return,
+            SourceItem::Header(_, _, _) => return,
         };
         let parent = path.parent().unwrap_or_else(|| Path::new(""));
         self.selection = if parent.as_os_str().is_empty() {
             items
                 .iter()
-                .position(|item| matches!(item, SourceItem::Header(actual, _) if *actual == group))
+                .position(
+                    |item| matches!(item, SourceItem::Header(actual, _, _) if *actual == group),
+                )
                 .unwrap_or(self.selection)
         } else {
             items
@@ -1098,9 +1121,6 @@ impl SidebarApp {
     }
 
     fn expand_or_source_child(&mut self) {
-        if self.git_view_mode != GitViewMode::Tree {
-            return;
-        }
         let items = self.source_items();
         let Some(item) = items.get(self.selection).cloned() else {
             return;
@@ -1112,7 +1132,7 @@ impl SidebarApp {
                 depth,
                 expanded,
                 ..
-            } => {
+            } if self.git_view_mode == GitViewMode::Tree => {
                 if !expanded {
                     self.git_tree_expanded.insert(source_tree_key(group, &path));
                     self.persist_source_preferences();
@@ -1123,15 +1143,18 @@ impl SidebarApp {
                     self.selection += 1;
                 }
             }
-            SourceItem::Header(group, _) => {
-                if items
+            SourceItem::Header(group, _, expanded) => {
+                if !expanded {
+                    self.git_collapsed_groups.remove(source_group_key(group));
+                    self.persist_source_preferences();
+                } else if items
                     .get(self.selection + 1)
                     .is_some_and(|next| source_item_group(next) == group)
                 {
                     self.selection += 1;
                 }
             }
-            SourceItem::Entry { .. } => {}
+            SourceItem::Directory { .. } | SourceItem::Entry { .. } => {}
         }
     }
 
@@ -1178,6 +1201,14 @@ impl SidebarApp {
                     return Ok(None);
                 }
                 if let Some(index) = hits.row_at(mouse.column, mouse.row) {
+                    if self.view == View::SourceControl
+                        && hits.disclosure_at(mouse.column, mouse.row) == Some(index)
+                    {
+                        self.selection = index;
+                        self.activate_source();
+                        self.keep_selection_visible();
+                        return Ok(None);
+                    }
                     let activate = self.selection == index;
                     self.selection = index;
                     if activate {
@@ -1752,6 +1783,7 @@ impl SidebarApp {
         state.git_view_mode = self.git_view_mode;
         state.git_tree_expanded = self.git_tree_expanded.clone();
         state.git_tree_initialized = self.git_tree_initialized;
+        state.git_collapsed_groups = self.git_collapsed_groups.clone();
         state.selection = selection;
         state.scroll = if self.view == View::Explorer {
             explorer_scroll
@@ -1994,21 +2026,21 @@ fn compare_source_paths(left: &Path, right: &Path) -> std::cmp::Ordering {
 }
 
 fn source_tree_key(group: SourceControlGroup, path: &Path) -> String {
-    format!(
-        "{}\0{}",
-        match group {
-            SourceControlGroup::MergeChanges => "merge",
-            SourceControlGroup::StagedChanges => "staged",
-            SourceControlGroup::Changes => "changes",
-            SourceControlGroup::Untracked => "untracked",
-        },
-        path.to_string_lossy()
-    )
+    format!("{}\0{}", source_group_key(group), path.to_string_lossy())
+}
+
+fn source_group_key(group: SourceControlGroup) -> &'static str {
+    match group {
+        SourceControlGroup::MergeChanges => "merge",
+        SourceControlGroup::StagedChanges => "staged",
+        SourceControlGroup::Changes => "changes",
+        SourceControlGroup::Untracked => "untracked",
+    }
 }
 
 fn source_item_group(item: &SourceItem) -> SourceControlGroup {
     match item {
-        SourceItem::Header(group, _)
+        SourceItem::Header(group, _, _)
         | SourceItem::Directory { group, .. }
         | SourceItem::Entry { group, .. } => *group,
     }
@@ -2016,7 +2048,7 @@ fn source_item_group(item: &SourceItem) -> SourceControlGroup {
 
 fn source_item_depth(item: &SourceItem) -> u16 {
     match item {
-        SourceItem::Header(_, _) => 0,
+        SourceItem::Header(_, _, _) => 0,
         SourceItem::Directory { depth, .. } | SourceItem::Entry { depth, .. } => *depth,
     }
 }
@@ -2624,6 +2656,85 @@ mod tests {
             *clipboard.paths.lock().expect("clipboard paths"),
             vec![PathBuf::from("dual.rs")]
         );
+    }
+
+    #[test]
+    fn source_control_groups_toggle_with_enter_and_single_disclosure_click() {
+        let (_directory, mut app) = test_app();
+        app.git_snapshot = Some(GitSnapshot {
+            root: app.workspace.path().to_path_buf(),
+            entries: vec![GitEntry {
+                path: PathBuf::from("changed.rs"),
+                rename_origin: None,
+                index_status: StatusCode::Clean,
+                worktree_status: StatusCode::Modified,
+                submodule: Default::default(),
+                conflict: None,
+                ignored: false,
+                untracked: false,
+            }],
+            ..GitSnapshot::default()
+        });
+        app.workspace.is_git_worktree = true;
+        app.view = View::SourceControl;
+
+        assert_eq!(app.source_items().len(), 2);
+        assert!(app.source_rows()[0].expanded);
+
+        app.handle_source_key(KeyCode::Enter)
+            .expect("collapse group with Enter");
+        assert_eq!(app.source_items().len(), 1);
+        assert!(!app.source_rows()[0].expanded);
+
+        app.handle_source_key(KeyCode::Enter)
+            .expect("expand group with Enter");
+        assert_eq!(app.source_items().len(), 2);
+        assert!(app.source_rows()[0].expanded);
+
+        app.selection = 1;
+        let area = ratatui::layout::Rect::new(0, 0, 32, 5);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let hits = crate::render::render(
+            &mut buffer,
+            area,
+            &app.render_model(),
+            &Palette::catppuccin(),
+        );
+        let disclosure = hits.disclosures[0].1;
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: disclosure.x,
+                row: disclosure.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hits,
+        )
+        .expect("collapse group with disclosure click");
+        assert_eq!(app.selection, 0);
+        assert_eq!(app.source_items().len(), 1);
+        assert!(app.git_collapsed_groups.contains("changes"));
+
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let hits = crate::render::render(
+            &mut buffer,
+            area,
+            &app.render_model(),
+            &Palette::catppuccin(),
+        );
+        let disclosure = hits.disclosures[0].1;
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: disclosure.x,
+                row: disclosure.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hits,
+        )
+        .expect("expand group with disclosure click");
+        assert_eq!(app.source_items().len(), 2);
+        assert!(!app.git_collapsed_groups.contains("changes"));
     }
 
     #[test]

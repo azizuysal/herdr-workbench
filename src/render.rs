@@ -98,6 +98,7 @@ pub struct HitTargets {
     pub search_case: Option<Rect>,
     pub search_regex: Option<Rect>,
     pub rows: Vec<(usize, Rect)>,
+    pub disclosures: Vec<(usize, Rect)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +116,14 @@ impl HitTargets {
             .iter()
             .find(|(_, r)| r.x <= col && col < r.right() && r.y <= row && row < r.bottom())
             .map(|(i, _)| *i)
+    }
+    pub fn disclosure_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.disclosures
+            .iter()
+            .find(|(_, area)| {
+                area.x <= col && col < area.right() && area.y <= row && row < area.bottom()
+            })
+            .map(|(index, _)| *index)
     }
     pub fn view_at(&self, col: u16, row: u16) -> Option<View> {
         let in_rect = |r: Option<Rect>| {
@@ -176,6 +185,7 @@ pub fn render(
     let mut targets = render_tabs(buffer, rows[0], model, palette);
     let content = render_content(buffer, rows[1], model, palette);
     targets.rows = content.rows;
+    targets.disclosures = content.disclosures;
     targets.query_cursor = content.query_cursor;
     targets.search_input = content.search.input;
     targets.search_files = content.search.files;
@@ -293,6 +303,7 @@ fn render_tabs(buffer: &mut Buffer, area: Rect, m: &RenderModel, p: &Palette) ->
 }
 struct RenderedContent {
     rows: Vec<(usize, Rect)>,
+    disclosures: Vec<(usize, Rect)>,
     query_cursor: Option<(u16, u16)>,
     search: SearchTargets,
 }
@@ -451,6 +462,7 @@ fn render_content(
             .render(content_area, buffer);
         return RenderedContent {
             rows: Vec::new(),
+            disclosures: Vec::new(),
             query_cursor,
             search,
         };
@@ -461,6 +473,7 @@ fn render_content(
             .render(content_area, buffer);
         return RenderedContent {
             rows: Vec::new(),
+            disclosures: Vec::new(),
             query_cursor,
             search,
         };
@@ -472,11 +485,13 @@ fn render_content(
             .render(content_area, buffer);
         return RenderedContent {
             rows: Vec::new(),
+            disclosures: Vec::new(),
             query_cursor,
             search,
         };
     }
     let mut hits = Vec::new();
+    let mut disclosures = Vec::new();
     let max = usize::from(content_area.height);
     for (slot, (index, row)) in m
         .rows
@@ -493,6 +508,12 @@ fn render_content(
             1,
         );
         hits.push((index, r));
+        if row.kind == EntryKind::Directory {
+            let marker_x =
+                r.x.saturating_add(row.depth.saturating_mul(2))
+                    .min(r.right().saturating_sub(1));
+            disclosures.push((index, Rect::new(marker_x, r.y, 1, 1)));
+        }
         render_row(buffer, r, row, m.icon_mode, p)
     }
     if m.rows.is_empty() {
@@ -507,6 +528,7 @@ fn render_content(
     }
     RenderedContent {
         rows: hits,
+        disclosures,
         query_cursor,
         search,
     }

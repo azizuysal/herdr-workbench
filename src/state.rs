@@ -52,6 +52,8 @@ pub struct SidebarState {
     #[serde(default)]
     pub git_tree_initialized: bool,
     #[serde(default)]
+    pub git_collapsed_groups: BTreeSet<String>,
+    #[serde(default)]
     pub selection: Option<String>,
     #[serde(default)]
     pub scroll: usize,
@@ -162,6 +164,7 @@ impl Default for SidebarState {
             git_view_mode: GitViewMode::Flat,
             git_tree_expanded: BTreeSet::new(),
             git_tree_initialized: false,
+            git_collapsed_groups: BTreeSet::new(),
             selection: None,
             scroll: 0,
         }

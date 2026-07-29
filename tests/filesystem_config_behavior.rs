@@ -110,6 +110,7 @@ fn state_round_trips_atomically_and_corruption_requires_explicit_reset() {
     tab.git_view_mode = GitViewMode::Tree;
     tab.git_tree_expanded.insert("changes\0src".into());
     tab.git_tree_initialized = true;
+    tab.git_collapsed_groups.insert("untracked".into());
     tab.selection = Some("src/main.rs".into());
     tab.scroll = 9;
     state.save_atomic(&path).unwrap();
