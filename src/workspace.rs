@@ -77,6 +77,22 @@ impl WorkspaceRoot {
         &self.root
     }
 
+    /// Promotes an immutable workspace root when that exact directory becomes a Git worktree.
+    /// A repository created in an ancestor never expands the workspace security boundary.
+    pub fn refresh_git_worktree(&mut self) -> Result<bool, WorkspaceError> {
+        if self.is_git_worktree {
+            return Ok(false);
+        }
+        let Some(root) = git_worktree_root(&self.root)? else {
+            return Ok(false);
+        };
+        if root != self.root {
+            return Ok(false);
+        }
+        self.is_git_worktree = true;
+        Ok(true)
+    }
+
     /// Resolves only a root-relative path. Existing symlinks must resolve within the immutable root.
     pub fn resolve_path(&self, relative: &Path) -> Result<PathBuf, WorkspaceError> {
         if relative.is_absolute() {

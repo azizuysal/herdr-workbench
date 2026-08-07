@@ -1522,7 +1522,17 @@ impl SidebarApp {
     }
 
     fn refresh_git(&mut self) {
-        if self.workspace.is_git_worktree && self.git_receiver.is_none() {
+        if !self.workspace.is_git_worktree {
+            match self.workspace.refresh_git_worktree() {
+                Ok(true) => self.git_error = None,
+                Ok(false) => return,
+                Err(error) => {
+                    self.error = Some(format!("Cannot detect Git repository\n{error}"));
+                    return;
+                }
+            }
+        }
+        if self.git_receiver.is_none() {
             self.git_receiver = Some(self.git.refresh_async());
             self.busy = true;
         }
@@ -1691,6 +1701,9 @@ impl SidebarApp {
             self.offset = 0;
         }
         self.input_mode = InputMode::Normal;
+        if view == View::SourceControl {
+            self.refresh_git();
+        }
     }
 
     fn next_view(&mut self) {
@@ -2569,6 +2582,48 @@ mod tests {
             model.notice.as_deref(),
             Some("No Git repository\nThis folder is not tracked by Git.")
         );
+    }
+
+    #[test]
+    fn source_control_detects_repository_initialized_after_startup() {
+        let (directory, mut app) = test_app();
+        app.switch_view(View::SourceControl);
+        assert!(!app.workspace.is_git_worktree);
+
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("initialize Git repository");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(directory.path().join("created.txt"), "created\n")
+            .expect("write untracked file");
+
+        app.pending_refresh = Some(Instant::now() - REFRESH_DEBOUNCE);
+        app.poll_background();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.git_receiver.is_some() && Instant::now() < deadline {
+            app.poll_background();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.workspace.is_git_worktree);
+        assert!(app.git_receiver.is_none(), "Git refresh did not finish");
+        assert!(app.git_error.is_none());
+        assert!(app.render_model().notice.is_none());
+        assert!(app.source_items().iter().any(|item| {
+            matches!(
+                item,
+                SourceItem::Entry { entry, .. } if entry.path == Path::new("created.txt")
+            )
+        }));
     }
 
     #[test]

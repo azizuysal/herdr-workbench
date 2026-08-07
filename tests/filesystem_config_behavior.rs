@@ -1,12 +1,34 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use herdr_workbench::config::{Config, ConfigError};
 use herdr_workbench::file_tree::{FileTree, NodeKind, Preview};
 use herdr_workbench::state::{DockSide, GitViewMode, PersistedState, SidebarView, StateError};
 use herdr_workbench::workspace::WorkspaceRoot;
 use tempfile::TempDir;
+
+#[test]
+fn detecting_a_new_repository_never_expands_the_workspace_root() {
+    let fixture = TempDir::new().unwrap();
+    let workspace_path = fixture.path().join("workspace");
+    fs::create_dir(&workspace_path).unwrap();
+    let mut workspace = WorkspaceRoot::resolve(&workspace_path).unwrap();
+
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(fixture.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    assert!(!workspace.refresh_git_worktree().unwrap());
+    assert!(!workspace.is_git_worktree);
+    assert_eq!(workspace.path(), workspace_path.canonicalize().unwrap());
+}
 
 #[test]
 fn config_is_strict_and_expands_only_an_explicit_argv_placeholder() {
