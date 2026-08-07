@@ -4,7 +4,7 @@
 use crate::{
     decoration::{GitCoordinates, decorate_directory, decorate_file, row_style},
     icons::{EntryKind, IconMode, file_color, icon_for},
-    state::GitViewMode,
+    state::{GitContentMode, GitViewMode},
     theme::Palette,
 };
 use ratatui::{
@@ -60,6 +60,7 @@ pub struct RenderModel {
     pub busy: bool,
     pub search_busy: bool,
     pub busy_frame: usize,
+    pub git_content_mode: GitContentMode,
     pub git_view_mode: GitViewMode,
 }
 impl Default for RenderModel {
@@ -81,6 +82,7 @@ impl Default for RenderModel {
             busy: false,
             search_busy: false,
             busy_frame: 0,
+            git_content_mode: GitContentMode::Changes,
             git_view_mode: GitViewMode::Flat,
         }
     }
@@ -89,6 +91,7 @@ impl Default for RenderModel {
 pub struct HitTargets {
     pub explorer: Option<Rect>,
     pub source_control: Option<Rect>,
+    pub git_content_toggle: Option<Rect>,
     pub git_view_toggle: Option<Rect>,
     pub close: Option<Rect>,
     pub query_cursor: Option<(u16, u16)>,
@@ -164,6 +167,12 @@ impl HitTargets {
             area.x <= col && col < area.right() && area.y <= row && row < area.bottom()
         })
     }
+
+    pub fn git_content_toggle_at(&self, col: u16, row: u16) -> bool {
+        self.git_content_toggle.is_some_and(|area| {
+            area.x <= col && col < area.right() && area.y <= row && row < area.bottom()
+        })
+    }
 }
 
 pub fn render(
@@ -218,15 +227,22 @@ fn render_tabs(buffer: &mut Buffer, area: Rect, m: &RenderModel, p: &Palette) ->
         close_width,
         1,
     );
-    let git_view_width = if m.view == View::SourceControl {
+    let git_content_width = if m.view == View::SourceControl {
         area.width.min(3)
     } else {
         0
     };
+    let git_view_width =
+        if m.view == View::SourceControl && m.git_content_mode == GitContentMode::Changes {
+            area.width.min(3)
+        } else {
+            0
+        };
     let busy_width = u16::from(m.busy && !m.search_busy);
     let available = area
         .width
         .saturating_sub(close_width)
+        .saturating_sub(git_content_width)
         .saturating_sub(git_view_width)
         .saturating_sub(busy_width);
     let tab_width = if available >= 10 {
@@ -288,6 +304,21 @@ fn render_tabs(buffer: &mut Buffer, area: Rect, m: &RenderModel, p: &Palette) ->
             .style(Style::default().fg(p.overlay1).bg(p.surface_dim))
             .render(toggle, buffer);
         targets.git_view_toggle = Some(toggle);
+    }
+    if git_content_width > 0 {
+        control_x = control_x.saturating_sub(git_content_width);
+        let toggle = Rect::new(control_x, area.y, git_content_width, 1);
+        let icon = match (m.git_content_mode, m.icon_mode) {
+            (GitContentMode::Changes, IconMode::NerdFont) => "",
+            (GitContentMode::History, IconMode::NerdFont) => "",
+            (GitContentMode::Changes, IconMode::Plain) => "C",
+            (GitContentMode::History, IconMode::Plain) => "H",
+        };
+        Paragraph::new(icon)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(p.overlay1).bg(p.surface_dim))
+            .render(toggle, buffer);
+        targets.git_content_toggle = Some(toggle);
     }
     if busy_width > 0 && control_x > next_x {
         control_x = control_x.saturating_sub(1);
@@ -468,7 +499,7 @@ fn render_content(
         };
     }
     if m.help {
-        Paragraph::new(help_text(m.view))
+        Paragraph::new(help_text(m.view, m.git_content_mode))
             .style(Style::default().fg(p.text))
             .render(content_area, buffer);
         return RenderedContent {
@@ -519,6 +550,8 @@ fn render_content(
     if m.rows.is_empty() {
         let message = if m.query.is_some() {
             "No results"
+        } else if m.view == View::SourceControl && m.git_content_mode == GitContentMode::History {
+            "No commits yet"
         } else {
             "No entries"
         };
@@ -605,7 +638,19 @@ fn render_row(buffer: &mut Buffer, area: Rect, row: &RenderRow, mode: IconMode, 
         decorate_file(file_color(icon, p), row.git, p)
     };
     let style = row_style(decoration, row.selected, row.focused, p);
-    let badge = if row.kind == EntryKind::Directory {
+    let sanitized_name = sanitize(&row.name);
+    let (display_name, history_age) = if row.kind == EntryKind::Commit {
+        sanitized_name
+            .rsplit_once(" · ")
+            .map_or((sanitized_name.as_str(), None), |(name, age)| {
+                (name, Some(age.to_string()))
+            })
+    } else {
+        (sanitized_name.as_str(), None)
+    };
+    let badge = if let Some(age) = history_age {
+        age
+    } else if row.kind == EntryKind::Directory {
         if decoration.directory_circle.is_some() {
             "●".to_string()
         } else {
@@ -625,7 +670,7 @@ fn render_row(buffer: &mut Buffer, area: Rect, row: &RenderRow, mode: IconMode, 
     let badge_width = UnicodeDisplayWidth(&badge).value();
     let fixed = indent.len() + 4 + badge_width;
     let width = usize::from(area.width).saturating_sub(fixed);
-    let name = truncate(&sanitize(&row.name), width.max(1));
+    let name = truncate(display_name, width.max(1));
     let mut spans = vec![
         Span::styled(indent, style),
         Span::styled(
@@ -647,13 +692,15 @@ fn render_row(buffer: &mut Buffer, area: Rect, row: &RenderRow, mode: IconMode, 
         Span::styled(name, style),
     ];
     let padding =
-        usize::from(area.width).saturating_sub(fixed + UnicodeDisplayWidth(&row.name).value());
+        usize::from(area.width).saturating_sub(fixed + UnicodeDisplayWidth(display_name).value());
     if !badge.is_empty() {
         spans.push(Span::raw(" ".repeat(padding)));
         spans.push(Span::styled(
             badge,
             Style::default()
-                .fg(if row.kind == EntryKind::Directory {
+                .fg(if row.kind == EntryKind::Commit {
+                    p.overlay1
+                } else if row.kind == EntryKind::Directory {
                     decoration.directory_circle.unwrap_or(p.text)
                 } else {
                     decoration.badge_color
@@ -705,13 +752,16 @@ pub fn sanitize_multiline(value: &str) -> String {
         .collect()
 }
 
-fn help_text(view: View) -> &'static str {
-    match view {
-        View::Explorer => {
-            "Explorer\n↑/↓, j/k  move\n←/→, h/l  fold/open\nEnter/Space  preview\no  external edit\nf  file manager\ny  copy path\n/  search\ni  ignored entries\nr  refresh\nd  switch dock side\n1/2, Tab  change view\nq  close sidebar\n? / Esc  close help\n\nSearch\nTab/Shift+Tab  scope\nAlt+C  case sensitive\nAlt+R  regular expression\nEnter  navigate results\nEsc  return to Explorer"
+fn help_text(view: View, git_content_mode: GitContentMode) -> &'static str {
+    match (view, git_content_mode) {
+        (View::Explorer, _) => {
+            "Explorer\n↑/↓, j/k  move\n←/→, h/l  fold/open\nEnter/Space  open/preview\no  external edit\nf  file manager\ny  copy path\n/  search\ni  ignored entries\nr  refresh\nd  switch dock side\n1/2, Tab  change view\nq  close sidebar\n? / Esc  close help\n\nSearch\nTab/Shift+Tab  scope\nAlt+C  case sensitive\nAlt+R  regular expression\nEnter/Space  open/preview\nEsc  return to Explorer"
         }
-        View::SourceControl => {
-            "Source Control\n↑/↓, j/k  move\n←/→, h/l  fold/open\nEnter  fold/preview\nv  tree/list view\nf  file manager\ny  copy path\nr  refresh\nd  switch dock side\n1/2, Tab  change view\nq  close sidebar\n? / Esc  close help"
+        (View::SourceControl, GitContentMode::Changes) => {
+            "Source Control · Changes\n↑/↓, j/k  move\n←/→, h/l  fold/open\nEnter/Space  fold/preview\ng  commit history\nv  tree/list view\nf  file manager\ny  copy path\nr  refresh\nd  switch dock side\n1/2, Tab  change view\nq  close sidebar\n? / Esc  close help"
+        }
+        (View::SourceControl, GitContentMode::History) => {
+            "Source Control · History\n↑/↓, j/k  move\nEnter/Space  preview commit\ng  working changes\ny  copy full hash\nr  refresh\nd  switch dock side\n1/2, Tab  change view\nq  close sidebar\n? / Esc  close help"
         }
     }
 }
@@ -811,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn git_view_control_stays_separate_from_tabs_close_and_file_badges() {
+    fn git_controls_stay_separate_from_tabs_close_and_file_badges() {
         assert_eq!(UnicodeWidthStr::width(""), 1);
         assert_eq!(UnicodeWidthStr::width(""), 1);
         for width in [20, 24, 32, 48, 80] {
@@ -838,11 +888,65 @@ mod tests {
 
             let targets = render(&mut buffer, area, &model, &Palette::catppuccin());
             let source = targets.source_control.expect("Source Control tab");
-            let toggle = targets.git_view_toggle.expect("Git view control");
+            let content = targets
+                .git_content_toggle
+                .expect("Git content mode control");
+            let view = targets.git_view_toggle.expect("Git view control");
             let close = targets.close.expect("close control");
-            assert!(source.right() <= toggle.x);
-            assert!(toggle.right() <= close.x);
+            assert!(source.right() <= content.x);
+            assert!(content.right() <= view.x);
+            assert!(view.right() <= close.x);
             assert_eq!(buffer[(width - 1, 1)].symbol(), "M");
+        }
+    }
+
+    #[test]
+    fn history_control_replaces_the_changes_layout_control_and_labels_empty_history() {
+        let area = Rect::new(0, 0, 32, 4);
+        let mut buffer = Buffer::empty(area);
+        let model = RenderModel {
+            view: View::SourceControl,
+            git_content_mode: GitContentMode::History,
+            ..RenderModel::default()
+        };
+
+        let targets = render(&mut buffer, area, &model, &Palette::catppuccin());
+
+        assert!(targets.git_content_toggle.is_some());
+        assert!(targets.git_view_toggle.is_none());
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("No commits yet"));
+    }
+
+    #[test]
+    fn history_age_remains_visible_when_the_subject_is_truncated() {
+        for width in [20, 24, 32] {
+            let area = Rect::new(0, 0, width, 3);
+            let mut buffer = Buffer::empty(area);
+            let model = RenderModel {
+                view: View::SourceControl,
+                git_content_mode: GitContentMode::History,
+                rows: vec![RenderRow {
+                    name: "d34db33 a subject that is much too long · 2h".into(),
+                    path: "d34db33".into(),
+                    kind: EntryKind::Commit,
+                    git: GitCoordinates::default(),
+                    expanded: false,
+                    depth: 0,
+                    selected: true,
+                    focused: true,
+                }],
+                ..RenderModel::default()
+            };
+
+            render(&mut buffer, area, &model, &Palette::catppuccin());
+
+            assert_eq!(buffer[(width - 2, 1)].symbol(), "2", "width {width}");
+            assert_eq!(buffer[(width - 1, 1)].symbol(), "h", "width {width}");
         }
     }
 

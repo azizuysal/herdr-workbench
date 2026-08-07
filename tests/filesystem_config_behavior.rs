@@ -5,7 +5,9 @@ use std::process::Command;
 
 use herdr_workbench::config::{Config, ConfigError};
 use herdr_workbench::file_tree::{FileTree, NodeKind, Preview};
-use herdr_workbench::state::{DockSide, GitViewMode, PersistedState, SidebarView, StateError};
+use herdr_workbench::state::{
+    DockSide, GitContentMode, GitViewMode, PersistedState, SidebarView, StateError,
+};
 use herdr_workbench::workspace::WorkspaceRoot;
 use tempfile::TempDir;
 
@@ -130,6 +132,7 @@ fn state_round_trips_atomically_and_corruption_requires_explicit_reset() {
     tab.view = SidebarView::SourceControl;
     tab.expanded.insert("src".into());
     tab.git_view_mode = GitViewMode::Tree;
+    tab.git_content_mode = GitContentMode::History;
     tab.git_tree_expanded.insert("changes\0src".into());
     tab.git_tree_initialized = true;
     tab.git_collapsed_groups.insert("untracked".into());

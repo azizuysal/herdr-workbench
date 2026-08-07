@@ -48,6 +48,8 @@ pub struct SidebarState {
     #[serde(default)]
     pub git_view_mode: GitViewMode,
     #[serde(default)]
+    pub git_content_mode: GitContentMode,
+    #[serde(default)]
     pub git_tree_expanded: BTreeSet<String>,
     #[serde(default)]
     pub git_tree_initialized: bool,
@@ -110,6 +112,23 @@ impl GitViewMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitContentMode {
+    #[default]
+    Changes,
+    History,
+}
+
+impl GitContentMode {
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Changes => Self::History,
+            Self::History => Self::Changes,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum StateError {
     Io {
@@ -162,6 +181,7 @@ impl Default for SidebarState {
             view: SidebarView::Explorer,
             expanded: BTreeSet::new(),
             git_view_mode: GitViewMode::Flat,
+            git_content_mode: GitContentMode::Changes,
             git_tree_expanded: BTreeSet::new(),
             git_tree_initialized: false,
             git_collapsed_groups: BTreeSet::new(),

@@ -41,6 +41,7 @@ const KIND_ENV: &str = "HERDR_WORKBENCH_PREVIEW_KIND";
 const PATH_ENV: &str = "HERDR_WORKBENCH_PREVIEW_PATH";
 const LINE_ENV: &str = "HERDR_WORKBENCH_PREVIEW_LINE";
 const GROUP_ENV: &str = "HERDR_WORKBENCH_PREVIEW_GROUP";
+const OID_ENV: &str = "HERDR_WORKBENCH_PREVIEW_OID";
 const MAX_VISUAL_ZOOM: u8 = 5;
 const VISUAL_PAN_STEP: i64 = 8;
 const VISUAL_WHEEL_STEP: i64 = 24;
@@ -54,6 +55,9 @@ pub enum PreviewRequest {
     Source {
         path: PathBuf,
         group: SourceControlGroup,
+    },
+    Commit {
+        oid: String,
     },
 }
 
@@ -95,20 +99,26 @@ impl<C: HerdrClient> PreviewOpener for HerdrPreviewOpener<C> {
         workspace: &WorkspaceRoot,
         request: &PreviewRequest,
     ) -> Result<(), PreviewError> {
-        let mut request_env = std::collections::BTreeMap::from([
-            (ROOT_ENV.to_string(), encode_path(workspace.path())),
-            (PATH_ENV.to_string(), encode_path(request.path())),
-        ]);
+        let mut request_env = std::collections::BTreeMap::from([(
+            ROOT_ENV.to_string(),
+            encode_path(workspace.path()),
+        )]);
         match request {
-            PreviewRequest::File { line, .. } => {
+            PreviewRequest::File { path, line } => {
                 request_env.insert(KIND_ENV.to_string(), "file".to_string());
+                request_env.insert(PATH_ENV.to_string(), encode_path(path));
                 if let Some(line) = line {
                     request_env.insert(LINE_ENV.to_string(), line.to_string());
                 }
             }
-            PreviewRequest::Source { group, .. } => {
+            PreviewRequest::Source { path, group } => {
                 request_env.insert(KIND_ENV.to_string(), "source".to_string());
+                request_env.insert(PATH_ENV.to_string(), encode_path(path));
                 request_env.insert(GROUP_ENV.to_string(), encode_group(*group).to_string());
+            }
+            PreviewRequest::Commit { oid } => {
+                request_env.insert(KIND_ENV.to_string(), "commit".to_string());
+                request_env.insert(OID_ENV.to_string(), oid.clone());
             }
         }
         self.client
@@ -128,9 +138,10 @@ impl<C: HerdrClient> PreviewOpener for HerdrPreviewOpener<C> {
 }
 
 impl PreviewRequest {
-    fn path(&self) -> &Path {
+    fn path(&self) -> Option<&Path> {
         match self {
-            Self::File { path, .. } | Self::Source { path, .. } => path,
+            Self::File { path, .. } | Self::Source { path, .. } => Some(path),
+            Self::Commit { .. } => None,
         }
     }
 }
@@ -144,10 +155,9 @@ struct PreviewInvocation {
 impl PreviewInvocation {
     fn from_env() -> Result<Self, PreviewError> {
         let root = decode_path(&required_env(ROOT_ENV)?)?;
-        let path = decode_path(&required_env(PATH_ENV)?)?;
         let request = match required_env(KIND_ENV)?.as_str() {
             "file" => PreviewRequest::File {
-                path,
+                path: decode_path(&required_env(PATH_ENV)?)?,
                 line: env::var(LINE_ENV)
                     .ok()
                     .map(|line| {
@@ -159,8 +169,11 @@ impl PreviewInvocation {
                     .transpose()?,
             },
             "source" => PreviewRequest::Source {
-                path,
+                path: decode_path(&required_env(PATH_ENV)?)?,
                 group: decode_group(&required_env(GROUP_ENV)?)?,
+            },
+            "commit" => PreviewRequest::Commit {
+                oid: required_env(OID_ENV)?,
             },
             kind => return Err(PreviewError::new(format!("invalid preview kind {kind:?}"))),
         };
@@ -291,12 +304,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let document =
         load_document(&invocation).unwrap_or_else(|error| PreviewDocument::error(title, error));
     let visual_path = if matches!(&document.content, PreviewContent::Visual(_)) {
-        Some(
-            invocation
-                .workspace
-                .resolve_path(invocation.request.path())
-                .map_err(|error| PreviewError::new(error.to_string()))?,
-        )
+        invocation
+            .request
+            .path()
+            .map(|path| invocation.workspace.resolve_path(path))
+            .transpose()
+            .map_err(|error| PreviewError::new(error.to_string()))?
     } else {
         None
     };
@@ -450,6 +463,25 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                 numbered_line_range,
             })
         }
+        PreviewRequest::Commit { oid } => {
+            if !invocation.workspace.is_git_worktree {
+                return Err(PreviewError::new("Commit preview requires a Git worktree"));
+            }
+            let provider = GitStatusProvider::new(invocation.workspace.path());
+            let preview = provider
+                .commit_preview(oid)
+                .map_err(|error| PreviewError::new(error.to_string()))?;
+            Ok(PreviewDocument {
+                title,
+                content: PreviewContent::Text(
+                    HighlightedText::diff(Path::new("commit.diff"), &preview)
+                        .map_err(PreviewError::new)?,
+                ),
+                initial_line: 0,
+                is_error: false,
+                numbered_line_range: None,
+            })
+        }
     }
 }
 
@@ -462,6 +494,9 @@ fn request_title(request: &PreviewRequest) -> String {
                 group_label(*group),
                 sanitize_terminal(&path.display().to_string())
             )
+        }
+        PreviewRequest::Commit { oid } => {
+            format!("Commit {}", oid.get(..oid.len().min(12)).unwrap_or(oid))
         }
     }
 }
@@ -1645,6 +1680,60 @@ mod tests {
     }
 
     #[test]
+    fn commit_opener_passes_only_the_validated_object_id_payload() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let workspace = WorkspaceRoot::resolve(directory.path()).expect("workspace");
+        let opener = HerdrPreviewOpener::new(FakeHerdr::new([Ok(serde_json::json!({}))]));
+        let oid = "a".repeat(40);
+
+        opener
+            .open(&workspace, &PreviewRequest::Commit { oid: oid.clone() })
+            .expect("open commit popup");
+
+        let calls = opener.client.calls();
+        assert_eq!(calls[0].1["env"][KIND_ENV], "commit");
+        assert_eq!(calls[0].1["env"][OID_ENV], oid);
+        assert!(calls[0].1["env"].get(PATH_ENV).is_none());
+    }
+
+    #[test]
+    fn commit_document_loads_local_metadata_stat_and_patch() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory.path())
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}");
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(directory.path().join("notes.txt"), "committed\n").expect("fixture");
+        git(&["add", "notes.txt"]);
+        git(&["commit", "-qm", "preview history"]);
+        let oid = String::from_utf8(git(&["rev-parse", "HEAD"]))
+            .expect("UTF-8 oid")
+            .trim()
+            .to_string();
+        let invocation = PreviewInvocation {
+            workspace: WorkspaceRoot::resolve(directory.path()).expect("workspace"),
+            request: PreviewRequest::Commit { oid: oid.clone() },
+        };
+
+        let document = load_document(&invocation).expect("commit preview");
+        let text = document.content.plain_text();
+
+        assert_eq!(document.title, format!("Commit {}", &oid[..12]));
+        assert!(text.contains("preview history"));
+        assert!(text.contains("notes.txt | 1 +"));
+        assert!(text.contains("+committed"));
+        assert_eq!(document.numbered_line_range, None);
+    }
+
+    #[test]
     fn file_document_is_root_bound_and_starts_near_a_search_match() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         std::fs::write(
@@ -1750,6 +1839,7 @@ mod tests {
         assert!(!key(KeyCode::Up, &mut vertical));
         assert_eq!(vertical, 0);
         assert!(key(KeyCode::Esc, &mut vertical));
+        assert!(key(KeyCode::Char(' '), &mut vertical));
     }
 
     #[test]

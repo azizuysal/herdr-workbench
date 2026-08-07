@@ -6,7 +6,7 @@ use herdr_workbench::{
     icons::{EntryKind, IconMode},
     preview::{PreviewContent, PreviewDocument, render_preview},
     render::{RenderModel, RenderRow, SearchScope, View, render},
-    state::GitViewMode,
+    state::{GitContentMode, GitViewMode},
     theme::{Appearance, Palette, ThemeOverrides, resolve},
 };
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
@@ -61,6 +61,8 @@ fn render_preview_text(
             (0..width)
                 .map(|column| buffer[(column, row)].symbol())
                 .collect::<String>()
+                .trim_end()
+                .to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -467,6 +469,29 @@ fn source_control_groups_and_popup_snapshot_matrix() {
         ],
         ..RenderModel::default()
     };
+    let history_model = RenderModel {
+        view: View::SourceControl,
+        git_content_mode: GitContentMode::History,
+        rows: vec![
+            row(
+                "d34db33 add local commit history · 2h",
+                EntryKind::Commit,
+                GitCoordinates::default(),
+                false,
+                0,
+                true,
+            ),
+            row(
+                "abc1234 fix Git refresh · 3d",
+                EntryKind::Commit,
+                GitCoordinates::default(),
+                false,
+                0,
+                false,
+            ),
+        ],
+        ..RenderModel::default()
+    };
     let diff_document = PreviewDocument {
         title: "Changes · dual.rs".to_string(),
         content: PreviewContent::Text(
@@ -492,12 +517,27 @@ fn source_control_groups_and_popup_snapshot_matrix() {
         is_error: false,
         numbered_line_range: None,
     };
+    let commit_document = PreviewDocument {
+        title: "Commit d34db33".to_string(),
+        content: PreviewContent::Text(
+            HighlightedText::diff(
+                std::path::Path::new("commit.diff"),
+                "commit d34db33\nAuthor: Test\n\n    add local commit history\n\n src/git.rs | 2 ++\n@@ -1 +1,2 @@\n old\n+new",
+            )
+            .unwrap(),
+        ),
+        initial_line: 0,
+        is_error: false,
+        numbered_line_range: None,
+    };
     let output = format!(
-        "== flat groups and dual membership ==\n{}\n\n== tree groups and dual membership ==\n{}\n\n== diff ==\n{}\n\n== untracked ==\n{}\n",
+        "== flat groups and dual membership ==\n{}\n\n== tree groups and dual membership ==\n{}\n\n== history ==\n{}\n\n== diff ==\n{}\n\n== untracked ==\n{}\n\n== commit ==\n{}\n",
         render_text(48, 12, &group_model, &Palette::catppuccin()),
         render_text(48, 10, &tree_model, &Palette::catppuccin()),
+        render_text(48, 6, &history_model, &Palette::catppuccin()),
         render_preview_text(48, 8, &diff_document, &Palette::catppuccin()),
-        render_preview_text(48, 8, &untracked_document, &Palette::catppuccin())
+        render_preview_text(48, 8, &untracked_document, &Palette::catppuccin()),
+        render_preview_text(48, 10, &commit_document, &Palette::catppuccin())
     );
     assert!(!output.contains('\u{1b}'));
     insta::assert_snapshot!("visual_contract_source_control", output);
@@ -517,6 +557,15 @@ fn help_and_actionable_error_snapshot_matrix() {
             "source control help",
             RenderModel {
                 view: View::SourceControl,
+                help: true,
+                ..RenderModel::default()
+            },
+        ),
+        (
+            "source control history help",
+            RenderModel {
+                view: View::SourceControl,
+                git_content_mode: GitContentMode::History,
                 help: true,
                 ..RenderModel::default()
             },

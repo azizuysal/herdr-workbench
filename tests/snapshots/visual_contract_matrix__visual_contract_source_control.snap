@@ -3,7 +3,7 @@ source: tests/visual_contract_matrix.rs
 expression: output
 ---
 == flat groups and dual membership ==
-  E    G                                    L  ×
+  E    G                                 C  L  ×
 ⌄ d Merge Changes (1)
     r conflict.rs                              C
 ⌄ d Staged Changes (1)
@@ -17,7 +17,7 @@ expression: output
 
 
 == tree groups and dual membership ==
-  E    G                                    T  ×
+  E    G                                 C  T  ×
 ⌄ d Staged Changes (1)
   ⌄ d src                                      ●
     │ r dual.rs                                A
@@ -28,16 +28,41 @@ expression: output
 
 
 
+== history ==
+  E    G                                    H  ×
+│ o d34db33 add local commit history          2h
+  o abc1234 fix Git refresh                   3d
+
+
+
+
 == diff ==
-diff --git a/dual.rs b/dual.rs                  
-@@ -1 +1 @@                                     
--old                                            
-+new�[31m                                       
-                                                
-                                                
-                                                
-                                                
+diff --git a/dual.rs b/dual.rs
+@@ -1 +1 @@
+-old
++new�[31m
+
+
+
+
 
 == untracked ==
-untracked: new.rs                               
+untracked: new.rs
    1 │ safe content
+
+
+
+
+
+
+
+== commit ==
+commit d34db33
+Author: Test
+
+    add local commit history
+
+ src/git.rs | 2 ++
+@@ -1 +1,2 @@
+ old
++new

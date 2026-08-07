@@ -38,7 +38,7 @@ fn documentation_config_and_manifest_match_the_shipped_contract() {
         );
     }
     for required in [
-        "Version 1.0.6",
+        "Version 1.0.7",
         "Herdr 0.7.5 or newer",
         "herdr plugin install azizuysal/herdr-workbench",
         "herdr plugin list --plugin herdr-workbench",
@@ -66,6 +66,9 @@ fn documentation_config_and_manifest_match_the_shipped_contract() {
         "Content search follows Explorer ignored-file visibility",
         "Ignored folder icons and names are muted",
         "Outside a Git repository",
+        "latest 50 commits",
+        "Toggle working changes / commit history",
+        "Press `Space` again to close it",
         "Toggle tree / flat layout",
         "macOS Quick Look",
         "Linux system viewer",

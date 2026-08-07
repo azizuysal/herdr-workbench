@@ -15,6 +15,16 @@ fn git(root: &std::path::Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
+fn git_output(root: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 fn repository() -> tempfile::TempDir {
     let root = tempdir().unwrap();
     git(root.path(), &["init", "-q"]);
@@ -102,6 +112,42 @@ fn git_failure_retains_the_last_valid_snapshot_and_conflicts_remain_distinct() {
         vec![entry]
     );
     assert_eq!(entry.badge(), "C");
+}
+
+#[test]
+fn history_is_newest_first_and_commit_preview_contains_metadata_stat_and_patch() {
+    let repository = repository();
+    let root = repository.path();
+    fs::write(root.join("tracked.txt"), "base\nsecond\n").unwrap();
+    git(root, &["add", "tracked.txt"]);
+    git(root, &["commit", "-qm", "second change"]);
+    let head = git_output(root, &["rev-parse", "HEAD"]);
+
+    let provider = GitStatusProvider::new(root);
+    let history = provider.history().unwrap();
+
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].oid, head);
+    assert_eq!(history[0].summary, "second change");
+    assert_eq!(history[1].summary, "initial");
+    let preview = provider.commit_preview(&history[0].oid).unwrap();
+    assert!(preview.contains(&format!("commit {}", history[0].oid)));
+    assert!(preview.contains("second change"));
+    assert!(preview.contains("tracked.txt | 1 +"));
+    assert!(preview.contains("+second"));
+}
+
+#[test]
+fn unborn_repository_has_an_empty_history() {
+    let repository = tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+
+    assert!(
+        GitStatusProvider::new(repository.path())
+            .history()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

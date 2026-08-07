@@ -21,6 +21,7 @@ pub enum IconMode {
 pub enum EntryKind {
     File,
     Directory,
+    Commit,
     Symlink,
     Unknown,
 }
@@ -73,6 +74,11 @@ const SYMLINK: Icon = Icon {
     plain: "@",
     color: FileColor::Teal,
 };
+const COMMIT: Icon = Icon {
+    nerd: "",
+    plain: "o",
+    color: FileColor::Yellow,
+};
 const UNKNOWN: Icon = Icon {
     nerd: "",
     plain: "?",
@@ -82,6 +88,7 @@ const UNKNOWN: Icon = Icon {
 pub fn icon_for(name: &str, kind: EntryKind) -> Icon {
     match kind {
         EntryKind::Symlink => SYMLINK,
+        EntryKind::Commit => COMMIT,
         EntryKind::Unknown => UNKNOWN,
         EntryKind::Directory => {
             let lower = name.to_ascii_lowercase();
@@ -143,7 +150,7 @@ mod tests {
     fn every_generated_mode_stays_one_cell() {
         for icon in generated::ICONS
             .iter()
-            .chain([&FILE, &DIRECTORY, &SYMLINK, &UNKNOWN])
+            .chain([&FILE, &DIRECTORY, &COMMIT, &SYMLINK, &UNKNOWN])
         {
             assert_eq!(icon.width(IconMode::Plain), 1, "{}", icon.plain);
             assert_eq!(icon.width(IconMode::NerdFont), 1, "{}", icon.nerd);

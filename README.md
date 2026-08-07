@@ -2,7 +2,7 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.6](https://img.shields.io/badge/version-1.0.6-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.7](https://img.shields.io/badge/version-1.0.7-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)
@@ -17,7 +17,7 @@ Herdr Workbench is a companion plugin for navigating and understanding a project
 
 - A fast Explorer with collapsible folders, colored file icons, Git decorations, and optional ignored-file visibility
 - Live filtering by file name or file contents, with case-sensitive and regular-expression modes
-- Read-only Source Control grouped into Merge Changes, Staged Changes, Changes, and Untracked Changes
+- Read-only Source Control with working changes and local commit history
 - Flat and tree layouts for Source Control
 - Syntax-highlighted text, Markdown, and Git diff previews
 - Image and PDF previews, including zoom and pan for visual files
@@ -86,7 +86,7 @@ Use `herdr plugin unlink herdr-workbench` before switching back to an installed 
 
 ### Explorer
 
-Open the sidebar and navigate with the arrow keys or Vim keys. `Enter` expands a folder or opens a preview for a file. Press `/` to search and `i` to show or hide ignored files. The repository's `.git` directory stays hidden unless `show_git_directory` is enabled.
+Open the sidebar and navigate with the arrow keys or Vim keys. `Enter` or `Space` expands a folder or opens a preview for a file. Press `/` to search and `i` to show or hide ignored files. The repository's `.git` directory stays hidden unless `show_git_directory` is enabled.
 
 File icons identify common languages, tools, and formats. Filenames and compact right-aligned badges show Git state, while folders use a small colored status dot. Ignored folder icons and names are muted.
 
@@ -105,9 +105,11 @@ Content search follows Explorer ignored-file visibility: ignored content is sear
 
 ### Source Control
 
-Press `2` or select the branch icon to open Source Control. Entries are grouped by their Git state and preserve separate index and working-tree changes. Press `v` to switch between flat and tree layouts.
+Press `2` or select the branch icon to open Source Control. The Changes mode groups entries by Git state and preserves separate index and working-tree changes. Press `v` to switch between flat and tree layouts.
 
-`Enter` opens a syntax-highlighted diff preview. The view is intentionally read-only: staging, committing, discarding, branch changes, and remote operations remain in your normal Git workflow.
+Press `g` or select the Changes/History control to show the latest 50 commits reachable from `HEAD`, newest first. Each row shows the short hash, subject, and relative age. `Enter` or `Space` opens a syntax-highlighted commit preview with metadata, file statistics, and patch; `y` copies its full hash. History is read locally and makes no network requests. An initialized repository without a commit shows an empty history.
+
+`Enter` or `Space` in Changes opens a syntax-highlighted diff preview. Both modes are intentionally read-only: staging, committing, discarding, branch changes, and remote operations remain in your normal Git workflow.
 
 Outside a Git repository, Source Control shows a short muted message instead of an error.
 
@@ -115,7 +117,7 @@ Outside a Git repository, Source Control shows a short muted message instead of 
 
 ### Preview, edit, and reveal
 
-`Enter` opens the selected file or diff in a centered overlay. Text previews support syntax highlighting, soft-wrapped long lines, scrolling, selection, and copy. Visual wrapping never changes the text copied with `Ctrl+A` and `Ctrl+C`. Line numbers are off by default; press `n` to show or hide them in file previews. Known images and PDFs render in the terminal, with `+`, `-`, and `0` for zoom.
+`Enter` or `Space` opens the selected file or diff in a centered overlay. Press `Space` again to close it. Text previews support syntax highlighting, soft-wrapped long lines, scrolling, selection, and copy. Visual wrapping never changes the text copied with `Ctrl+A` and `Ctrl+C`. Line numbers are off by default; press `n` to show or hide them in file previews. Known images and PDFs render in the terminal, with `+`, `-`, and `0` for zoom.
 
 Press `o` to hand the file to another viewer:
 
@@ -145,7 +147,7 @@ Dock side is remembered independently for each Herdr tab.
 | --- | --- |
 | `Up` / `Down`, `k` / `j` | Move selection |
 | `Left` / `Right`, `h` / `l` | Collapse / expand |
-| `Enter` | Expand a folder or preview a file |
+| `Enter` / `Space` | Expand a folder or preview a file |
 | `/` | Start live search |
 | `i` | Show / hide ignored files |
 | `r` | Refresh |
@@ -163,6 +165,7 @@ Dock side is remembered independently for each Herdr tab.
 | `Alt+R` or the `.*` control | Toggle regular expressions |
 | `Up` / `Down` | Move through results |
 | `Enter` | Leave query entry or preview the selected result |
+| `Space` | Type a space in the query, or preview the selected result when query entry is inactive |
 | `Esc` | Close search |
 
 ### Source Control
@@ -171,11 +174,12 @@ Dock side is remembered independently for each Herdr tab.
 | --- | --- |
 | `Up` / `Down`, `k` / `j` | Move selection |
 | `Left` / `Right`, `h` / `l` | Collapse / expand a group or folder |
-| `Enter` | Expand a row or preview its Git diff |
+| `Enter` / `Space` | Expand a row or preview its Git diff or commit |
+| `g` | Toggle working changes / commit history |
 | `v` | Toggle tree / flat layout |
 | `r` | Refresh |
 | `f` | Reveal in Finder or the Linux file manager |
-| `y` | Copy the selected path |
+| `y` | Copy the selected path or full commit hash |
 
 ### Preview
 

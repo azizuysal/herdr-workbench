@@ -15,6 +15,15 @@ use std::{
 };
 
 const PREVIEW_BYTE_LIMIT: u64 = 256 * 1024;
+pub const HISTORY_LIMIT: usize = 50;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommit {
+    pub oid: String,
+    pub short_oid: String,
+    pub timestamp: i64,
+    pub summary: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitError {
@@ -287,6 +296,101 @@ impl GitStatusProvider {
         receiver
     }
 
+    pub fn history(&self) -> Result<Vec<GitCommit>, GitError> {
+        let head = Command::new("git")
+            .args([
+                "--no-optional-locks",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "HEAD",
+            ])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|error| GitError {
+                command: "git rev-parse --verify --quiet HEAD".into(),
+                message: error.to_string(),
+            })?;
+        if !head.status.success() {
+            if head.stderr.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(GitError {
+                command: "git rev-parse --verify --quiet HEAD".into(),
+                message: sanitize_bytes(&head.stderr),
+            });
+        }
+
+        let output = Command::new("git")
+            .args(["--no-optional-locks", "log"])
+            .arg(format!("--max-count={HISTORY_LIMIT}"))
+            .args(["--date-order", "-z", "--format=%H%x00%h%x00%at%x00%s"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|error| GitError {
+                command: "git log".into(),
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(GitError {
+                command: "git log".into(),
+                message: sanitize_bytes(&output.stderr),
+            });
+        }
+        parse_history(&output.stdout)
+    }
+
+    pub fn history_async(&self) -> mpsc::Receiver<Result<Vec<GitCommit>, GitError>> {
+        let provider = self.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(provider.history());
+        });
+        receiver
+    }
+
+    pub fn commit_preview(&self, oid: &str) -> Result<String, GitError> {
+        if !valid_full_oid(oid) {
+            return Err(GitError {
+                command: "commit preview".into(),
+                message: "commit id must be a full hexadecimal object id".into(),
+            });
+        }
+        let output = Command::new("git")
+            .args([
+                "--no-optional-locks",
+                "show",
+                "--no-ext-diff",
+                "--no-color",
+                "--format=fuller",
+                "--stat",
+                "--patch",
+                "--max-count=1",
+                oid,
+                "--",
+            ])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|error| GitError {
+                command: "git show".into(),
+                message: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(GitError {
+                command: "git show".into(),
+                message: sanitize_bytes(&output.stderr),
+            });
+        }
+        let mut stdout = output.stdout;
+        let truncated = stdout.len() as u64 > PREVIEW_BYTE_LIMIT;
+        stdout.truncate(PREVIEW_BYTE_LIMIT as usize);
+        let mut preview = sanitize_bytes(&stdout);
+        if truncated {
+            preview.push_str("\n[commit preview truncated]");
+        }
+        Ok(preview)
+    }
+
     pub fn preview(&self, entry: &GitEntry, group: SourceControlGroup) -> Result<String, GitError> {
         let path = safe_relative(&entry.path).ok_or_else(|| GitError {
             command: "preview".into(),
@@ -395,6 +499,64 @@ impl GitStatusProvider {
         }
         Ok(preview)
     }
+}
+
+fn parse_history(bytes: &[u8]) -> Result<Vec<GitCommit>, GitError> {
+    let mut fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if fields.last().is_some_and(|field| field.is_empty()) {
+        fields.pop();
+    }
+    if !fields.len().is_multiple_of(4) {
+        return Err(GitError {
+            command: "git log".into(),
+            message: "unexpected commit history output".into(),
+        });
+    }
+    fields
+        .chunks_exact(4)
+        .map(|fields| {
+            let oid = String::from_utf8_lossy(fields[0]).into_owned();
+            let short_oid = String::from_utf8_lossy(fields[1]).into_owned();
+            let timestamp = String::from_utf8_lossy(fields[2])
+                .parse::<i64>()
+                .map_err(|_| GitError {
+                    command: "git log".into(),
+                    message: "invalid commit timestamp".into(),
+                })?;
+            if !valid_full_oid(&oid)
+                || short_oid.is_empty()
+                || !short_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(GitError {
+                    command: "git log".into(),
+                    message: "invalid commit object id".into(),
+                });
+            }
+            Ok(GitCommit {
+                oid,
+                short_oid,
+                timestamp,
+                summary: sanitize_history_summary(fields[3]),
+            })
+        })
+        .collect()
+}
+
+fn valid_full_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sanitize_history_summary(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 pub fn snapshot_from_git(root: &Path) -> Result<GitSnapshot, GitError> {
@@ -647,5 +809,34 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(not(unix))]
     {
         PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_parser_rejects_partial_records_and_sanitizes_subjects() {
+        assert!(parse_history(b"abc\0def\0").is_err());
+        let oid = "a".repeat(40);
+        let input = format!("{oid}\0abcdef0\01700000000\0subject\twith\ncontrols\0");
+
+        let commits = parse_history(input.as_bytes()).expect("parse history");
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].summary, "subject with controls");
+    }
+
+    #[test]
+    fn commit_preview_requires_a_full_object_id() {
+        let error = GitStatusProvider::new(".")
+            .commit_preview("HEAD")
+            .expect_err("symbolic revision must be rejected");
+
+        assert_eq!(
+            error.message,
+            "commit id must be a full hexadecimal object id"
+        );
     }
 }

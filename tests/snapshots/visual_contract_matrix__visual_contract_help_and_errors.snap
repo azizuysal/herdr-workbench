@@ -1,6 +1,5 @@
 ---
 source: tests/visual_contract_matrix.rs
-assertion_line: 572
 expression: output
 ---
 == explorer help ==
@@ -8,7 +7,7 @@ expression: output
 Explorer
 ↑/↓, j/k  move
 ←/→, h/l  fold/open
-Enter/Space  preview
+Enter/Space  open/preview
 o  external edit
 f  file manager
 y  copy path
@@ -24,15 +23,16 @@ Search
 Tab/Shift+Tab  scope
 Alt+C  case sensitive
 Alt+R  regular expression
-Enter  navigate results
+Enter/Space  open/preview
 Esc  return to Explorer
 
 == source control help ==
-  E    G                                    L  ×
-Source Control
+  E    G                                 C  L  ×
+Source Control · Changes
 ↑/↓, j/k  move
 ←/→, h/l  fold/open
-Enter  fold/preview
+Enter/Space  fold/preview
+g  commit history
 v  tree/list view
 f  file manager
 y  copy path
@@ -50,9 +50,32 @@ q  close sidebar
 
 
 
+== source control history help ==
+  E    G                                    H  ×
+Source Control · History
+↑/↓, j/k  move
+Enter/Space  preview commit
+g  working changes
+y  copy full hash
+r  refresh
+d  switch dock side
+1/2, Tab  change view
+q  close sidebar
+? / Esc  close help
+
+
+
+
+
+
+
+
+
+
+
 
 == non-Git workspace ==
-  E    G                                    L  ×
+  E    G                                 C  L  ×
 No Git repository
 This folder is not tracked by Git.
 
@@ -91,10 +114,3 @@ be at least 24 columns
   E    G                                       ×
 state file is corrupt; move it aside explicitly
 before reset
-
-
-
-
-
-
-

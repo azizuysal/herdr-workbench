@@ -26,8 +26,8 @@ use crate::decoration::{GitCoordinates, GitState};
 use crate::file_manager::{FileManagerOpener, SystemFileManagerOpener};
 use crate::file_tree::{FileTree, NodeKind};
 use crate::git::{
-    DirectoryStatus, GitEntry, GitError, GitSnapshot, GitStatusProvider, SourceControlGroup,
-    StatusCode,
+    DirectoryStatus, GitCommit, GitEntry, GitError, GitSnapshot, GitStatusProvider,
+    SourceControlGroup, StatusCode,
 };
 use crate::herdr::{
     CompanionEvent, CompanionMonitor, HerdrClient, InvocationContext, LiveHerdr,
@@ -40,7 +40,7 @@ use crate::search::{
     SearchHandle, SearchMode, SearchProvider, SearchQuery, SearchResults, SearchUpdate,
     fuzzy_filename_matches,
 };
-use crate::state::{GitViewMode, PersistedState, SidebarState, SidebarView};
+use crate::state::{GitContentMode, GitViewMode, PersistedState, SidebarState, SidebarView};
 use crate::theme::{Appearance, ThemeResolution};
 use crate::workspace::WorkspaceRoot;
 
@@ -271,6 +271,9 @@ struct SidebarApp {
     git_snapshot: Option<GitSnapshot>,
     git_receiver: Option<mpsc::Receiver<Result<GitSnapshot, GitError>>>,
     git_error: Option<String>,
+    git_history: Vec<GitCommit>,
+    git_history_receiver: Option<mpsc::Receiver<Result<Vec<GitCommit>, GitError>>>,
+    git_history_error: Option<String>,
     search: SearchProvider,
     search_handle: Option<SearchHandle>,
     search_results: SearchResults,
@@ -279,6 +282,7 @@ struct SidebarApp {
     search_active: bool,
     search_origin: Option<(usize, usize)>,
     view: View,
+    git_content_mode: GitContentMode,
     git_view_mode: GitViewMode,
     git_tree_expanded: BTreeSet<String>,
     git_tree_initialized: bool,
@@ -358,7 +362,10 @@ impl SidebarApp {
         let (theme_path, theme, theme_modified) = theme_state;
         let git = GitStatusProvider::new(workspace.path());
         let git_receiver = workspace.is_git_worktree.then(|| git.refresh_async());
-        let busy = git_receiver.is_some();
+        let git_history_receiver = (workspace.is_git_worktree
+            && saved.git_content_mode == GitContentMode::History)
+            .then(|| git.history_async());
+        let busy = git_receiver.is_some() || git_history_receiver.is_some();
         let search = SearchProvider::new(workspace.path());
         let (sender, receiver) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
@@ -390,6 +397,9 @@ impl SidebarApp {
             git_snapshot: None,
             git_receiver,
             git_error: None,
+            git_history: Vec::new(),
+            git_history_receiver,
+            git_history_error: None,
             search,
             search_handle: None,
             search_results: SearchResults::default(),
@@ -398,6 +408,7 @@ impl SidebarApp {
             search_active: false,
             search_origin: None,
             view,
+            git_content_mode: saved.git_content_mode,
             git_view_mode: saved.git_view_mode,
             git_tree_expanded: saved.git_tree_expanded.clone(),
             git_tree_initialized: saved.git_tree_initialized,
@@ -431,6 +442,9 @@ impl SidebarApp {
             View::Explorer if self.uses_filtered_explorer_rows() => self.filtered_explorer_rows(),
             View::Explorer if self.search_active => self.search_rows(),
             View::Explorer => self.explorer_rows(),
+            View::SourceControl if self.git_content_mode == GitContentMode::History => {
+                self.history_rows()
+            }
             View::SourceControl => self.source_rows(),
         };
         RenderModel {
@@ -463,13 +477,17 @@ impl SidebarApp {
                 })
                 .or_else(|| {
                     (self.view == View::SourceControl && self.workspace.is_git_worktree)
-                        .then(|| self.git_error.clone())
+                        .then(|| match self.git_content_mode {
+                            GitContentMode::Changes => self.git_error.clone(),
+                            GitContentMode::History => self.git_history_error.clone(),
+                        })
                         .flatten()
                 }),
             help: self.help,
             busy: self.busy,
             search_busy: self.search_handle.is_some(),
             busy_frame: 0,
+            git_content_mode: self.git_content_mode,
             git_view_mode: self.git_view_mode,
         }
     }
@@ -688,6 +706,31 @@ impl SidebarApp {
             .collect()
     }
 
+    fn history_rows(&self) -> Vec<RenderRow> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs() as i64);
+        self.git_history
+            .iter()
+            .enumerate()
+            .map(|(index, commit)| RenderRow {
+                name: format!(
+                    "{} {} · {}",
+                    commit.short_oid,
+                    commit.summary,
+                    relative_commit_age(commit.timestamp, now)
+                ),
+                path: commit.oid.clone(),
+                kind: EntryKind::Commit,
+                git: GitCoordinates::default(),
+                expanded: false,
+                depth: 0,
+                selected: index == self.selection,
+                focused: index == self.selection,
+            })
+            .collect()
+    }
+
     fn git_coordinates(&self, path: &Path, kind: NodeKind, ignored: bool) -> GitCoordinates {
         if kind == NodeKind::Directory {
             let aggregate = self
@@ -817,10 +860,10 @@ impl SidebarApp {
     fn handle_search_key(&mut self, key: KeyCode) -> AppResult<()> {
         match key {
             KeyCode::Char('/') => self.input_mode = InputMode::SearchQuery,
-            KeyCode::Enter if self.uses_filtered_explorer_rows() => {
+            KeyCode::Enter | KeyCode::Char(' ') if self.uses_filtered_explorer_rows() => {
                 self.activate_filtered_explorer();
             }
-            KeyCode::Enter => self.preview_selected_search(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.preview_selected_search(),
             KeyCode::Char('o') if self.uses_filtered_explorer_rows() => {
                 self.open_selected_filtered_explorer();
             }
@@ -922,16 +965,29 @@ impl SidebarApp {
             self.selection = selection;
             self.offset = offset;
         }
-        self.busy = self.git_receiver.is_some();
+        self.update_busy();
     }
 
     fn handle_source_key(&mut self, key: KeyCode) -> AppResult<()> {
+        if key == KeyCode::Char('g') {
+            self.toggle_git_content_mode();
+            return Ok(());
+        }
+        if self.git_content_mode == GitContentMode::History {
+            match key {
+                KeyCode::Char('r') => self.refresh_git(),
+                KeyCode::Enter | KeyCode::Char(' ') => self.preview_selected_commit(),
+                KeyCode::Char('y') => self.copy_selected_commit_hash(),
+                _ => {}
+            }
+            return Ok(());
+        }
         match key {
             KeyCode::Char('r') => self.refresh_git(),
             KeyCode::Char('v') => self.toggle_git_view(),
             KeyCode::Left | KeyCode::Char('h') => self.collapse_or_source_parent(),
             KeyCode::Right | KeyCode::Char('l') => self.expand_or_source_child(),
-            KeyCode::Enter => self.activate_source(),
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate_source(),
             KeyCode::Char('f') => self.reveal_selected_source(),
             KeyCode::Char('y') => self.copy_selected_source_path(),
             _ => {}
@@ -940,6 +996,10 @@ impl SidebarApp {
     }
 
     fn activate_source(&mut self) {
+        if self.git_content_mode == GitContentMode::History {
+            self.preview_selected_commit();
+            return;
+        }
         let changed = match self.source_items().get(self.selection).cloned() {
             Some(SourceItem::Directory {
                 group,
@@ -985,6 +1045,16 @@ impl SidebarApp {
             }
         }
         self.restore_source_selection(selected);
+        self.persist_source_preferences();
+    }
+
+    fn toggle_git_content_mode(&mut self) {
+        self.git_content_mode = self.git_content_mode.opposite();
+        self.selection = 0;
+        self.offset = 0;
+        if self.git_content_mode == GitContentMode::History {
+            self.refresh_history();
+        }
         self.persist_source_preferences();
     }
 
@@ -1185,6 +1255,10 @@ impl SidebarApp {
                     self.toggle_git_view();
                     return Ok(None);
                 }
+                if hits.git_content_toggle_at(mouse.column, mouse.row) {
+                    self.toggle_git_content_mode();
+                    return Ok(None);
+                }
                 if let Some(view) = hits.view_at(mouse.column, mouse.row) {
                     self.switch_view(view);
                     return Ok(None);
@@ -1347,6 +1421,18 @@ impl SidebarApp {
         }
     }
 
+    fn copy_selected_commit_hash(&mut self) {
+        let oid = self
+            .git_history
+            .get(self.selection)
+            .map(|commit| commit.oid.clone());
+        if let Some(oid) = oid
+            && let Err(error) = self.clipboard.copy_text(&oid)
+        {
+            self.error = Some(format!("Cannot copy commit hash\n{error}"));
+        }
+    }
+
     fn copy_path(&mut self, path: &Path) {
         if let Err(error) = self.clipboard.copy_path(path) {
             self.error = Some(format!("Cannot copy path\n{error}"));
@@ -1487,6 +1573,16 @@ impl SidebarApp {
         });
     }
 
+    fn preview_selected_commit(&mut self) {
+        let oid = self
+            .git_history
+            .get(self.selection)
+            .map(|commit| commit.oid.clone());
+        if let Some(oid) = oid {
+            self.open_preview(PreviewRequest::Commit { oid });
+        }
+    }
+
     fn open_preview(&mut self, request: PreviewRequest) {
         if let Err(error) = self.preview_opener.open(&self.workspace, &request) {
             self.error = Some(format!("Cannot open centered preview\n{error}"));
@@ -1501,7 +1597,7 @@ impl SidebarApp {
         self.search_error = None;
         if self.search_query.text.is_empty() || self.search_query.mode == SearchMode::Filename {
             self.search_results = SearchResults::default();
-            self.busy = self.git_receiver.is_some();
+            self.update_busy();
             return;
         }
         self.search_results = SearchResults::default();
@@ -1534,7 +1630,18 @@ impl SidebarApp {
         }
         if self.git_receiver.is_none() {
             self.git_receiver = Some(self.git.refresh_async());
-            self.busy = true;
+        }
+        self.refresh_history();
+        self.update_busy();
+    }
+
+    fn refresh_history(&mut self) {
+        if self.workspace.is_git_worktree
+            && self.git_content_mode == GitContentMode::History
+            && self.git_history_receiver.is_none()
+        {
+            self.git_history_receiver = Some(self.git.history_async());
+            self.git_history_error = None;
         }
     }
 
@@ -1589,6 +1696,31 @@ impl SidebarApp {
                     self.git_error = Some(format!(
                         "Git status unavailable\n{detail}\nLast valid status retained. Run git status in the workspace root."
                     ))
+                }
+            }
+        }
+
+        let history_result = self
+            .git_history_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(result) = history_result {
+            self.git_history_receiver = None;
+            match result {
+                Ok(commits) => {
+                    self.git_history = commits;
+                    self.git_history_error = None;
+                }
+                Err(error) => {
+                    let detail = error
+                        .message
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("Git returned no diagnostic")
+                        .trim();
+                    self.git_history_error = Some(format!(
+                        "Git history unavailable\n{detail}\nLast valid history retained. Run git log in the workspace root."
+                    ));
                 }
             }
         }
@@ -1648,7 +1780,7 @@ impl SidebarApp {
             }
         }
 
-        self.busy = self.git_receiver.is_some() || self.search_handle.is_some();
+        self.update_busy();
         if self.last_config_poll.elapsed() >= CONFIG_POLL {
             self.last_config_poll = Instant::now();
             self.reload_configuration();
@@ -1736,8 +1868,17 @@ impl SidebarApp {
             }
             View::Explorer if self.search_active => self.search_items().len(),
             View::Explorer => self.explorer_items().len(),
+            View::SourceControl if self.git_content_mode == GitContentMode::History => {
+                self.git_history.len()
+            }
             View::SourceControl => self.source_items().len(),
         }
+    }
+
+    fn update_busy(&mut self) {
+        self.busy = self.git_receiver.is_some()
+            || self.git_history_receiver.is_some()
+            || self.search_handle.is_some();
     }
 
     fn set_viewport_rows(&mut self, rows: usize) {
@@ -1793,6 +1934,7 @@ impl SidebarApp {
             View::SourceControl => SidebarView::SourceControl,
         };
         state.expanded = expanded;
+        state.git_content_mode = self.git_content_mode;
         state.git_view_mode = self.git_view_mode;
         state.git_tree_expanded = self.git_tree_expanded.clone();
         state.git_tree_initialized = self.git_tree_initialized;
@@ -2096,6 +2238,18 @@ fn file_modified(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+fn relative_commit_age(timestamp: i64, now: i64) -> String {
+    let seconds = now.saturating_sub(timestamp).max(0);
+    match seconds {
+        0..=59 => "now".to_string(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        86_400..=604_799 => format!("{}d", seconds / 86_400),
+        604_800..=31_535_999 => format!("{}w", seconds / 604_800),
+        _ => format!("{}y", seconds / 31_536_000),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,6 +2301,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingClipboard {
         paths: Arc<Mutex<Vec<PathBuf>>>,
+        texts: Arc<Mutex<Vec<String>>>,
     }
 
     impl ClipboardWriter for RecordingClipboard {
@@ -2157,12 +2312,24 @@ mod tests {
                 .push(path.to_owned());
             Ok(())
         }
+
+        fn copy_text(&self, text: &str) -> Result<(), crate::clipboard::ClipboardError> {
+            self.texts
+                .lock()
+                .expect("clipboard texts mutex")
+                .push(text.to_string());
+            Ok(())
+        }
     }
 
     struct FailingClipboard;
 
     impl ClipboardWriter for FailingClipboard {
         fn copy_path(&self, _path: &Path) -> Result<(), crate::clipboard::ClipboardError> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed terminal").into())
+        }
+
+        fn copy_text(&self, _text: &str) -> Result<(), crate::clipboard::ClipboardError> {
             Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed terminal").into())
         }
     }
@@ -2295,8 +2462,8 @@ mod tests {
             *clipboard.paths.lock().expect("clipboard paths"),
             vec![PathBuf::from("other.rs")]
         );
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .expect("preview filtered result");
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("preview filtered result with Space");
         assert_eq!(
             *previews.requests.lock().expect("preview requests"),
             vec![PreviewRequest::File {
@@ -2407,6 +2574,18 @@ mod tests {
     }
 
     #[test]
+    fn space_remains_literal_while_typing_a_search_query() {
+        let (_directory, mut app) = test_app();
+        app.open_inline_search();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("type a space in the query");
+
+        assert_eq!(app.search_query.text, " ");
+        assert_eq!(app.input_mode, InputMode::SearchQuery);
+    }
+
+    #[test]
     fn visible_search_controls_switch_scope_without_stealing_query_characters() {
         let (_directory, mut app) = test_app();
         app.open_inline_search();
@@ -2489,7 +2668,8 @@ mod tests {
         assert_eq!(app.search_results.files[0].path, Path::new("child.txt"));
         assert_eq!(app.search_results.files[0].matches[0].line, 1);
         app.selection = 1;
-        app.preview_selected_search();
+        app.handle_search_key(KeyCode::Char(' '))
+            .expect("preview content result with Space");
         assert_eq!(
             *previews.requests.lock().expect("preview requests"),
             vec![PreviewRequest::File {
@@ -2683,7 +2863,8 @@ mod tests {
         app.view = View::SourceControl;
         app.selection = 3;
 
-        app.preview_selected_source();
+        app.handle_source_key(KeyCode::Char(' '))
+            .expect("preview source path with Space");
 
         assert_eq!(
             *previews.requests.lock().expect("preview requests"),
@@ -2713,6 +2894,80 @@ mod tests {
     }
 
     #[test]
+    fn source_control_history_previews_commits_and_copies_full_hashes() {
+        let (_directory, mut app) = test_app();
+        let previews = RecordingPreviewOpener::default();
+        let clipboard = RecordingClipboard::default();
+        app.preview_opener = Box::new(previews.clone());
+        app.clipboard = Box::new(clipboard.clone());
+        app.view = View::SourceControl;
+        app.git_content_mode = GitContentMode::History;
+        app.git_history = vec![GitCommit {
+            oid: "a".repeat(40),
+            short_oid: "aaaaaaa".to_string(),
+            timestamp: 1_700_000_000,
+            summary: "add history".to_string(),
+        }];
+
+        app.handle_source_key(KeyCode::Char(' '))
+            .expect("preview selected commit with Space");
+        app.handle_source_key(KeyCode::Char('y'))
+            .expect("copy selected commit hash");
+
+        assert_eq!(
+            *previews.requests.lock().expect("preview requests"),
+            vec![PreviewRequest::Commit {
+                oid: "a".repeat(40)
+            }]
+        );
+        assert_eq!(
+            *clipboard.texts.lock().expect("clipboard texts"),
+            vec!["a".repeat(40)]
+        );
+        assert_eq!(app.history_rows()[0].kind, EntryKind::Commit);
+        assert!(
+            app.history_rows()[0]
+                .name
+                .starts_with("aaaaaaa add history · ")
+        );
+    }
+
+    #[test]
+    fn source_control_content_mode_toggles_from_keyboard_and_mouse_and_persists() {
+        let (_directory, mut app) = test_app();
+        app.view = View::SourceControl;
+
+        app.handle_source_key(KeyCode::Char('g'))
+            .expect("open history from keyboard");
+        assert_eq!(app.git_content_mode, GitContentMode::History);
+        let saved = PersistedState::load(&app.state_path).expect("load persisted content mode");
+        assert_eq!(
+            saved
+                .tab(&app.workspace_id, &app.tab_id)
+                .expect("saved workspace tab")
+                .git_content_mode,
+            GitContentMode::History
+        );
+
+        let hits = HitTargets {
+            git_content_toggle: Some(ratatui::layout::Rect::new(10, 0, 3, 1)),
+            ..HitTargets::default()
+        };
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hits,
+        )
+        .expect("return to changes from mouse");
+
+        assert_eq!(app.git_content_mode, GitContentMode::Changes);
+    }
+
+    #[test]
     fn source_control_groups_toggle_with_enter_and_single_disclosure_click() {
         let (_directory, mut app) = test_app();
         app.git_snapshot = Some(GitSnapshot {
@@ -2735,8 +2990,8 @@ mod tests {
         assert_eq!(app.source_items().len(), 2);
         assert!(app.source_rows()[0].expanded);
 
-        app.handle_source_key(KeyCode::Enter)
-            .expect("collapse group with Enter");
+        app.handle_source_key(KeyCode::Char(' '))
+            .expect("collapse group with Space");
         assert_eq!(app.source_items().len(), 1);
         assert!(!app.source_rows()[0].expanded);
 
@@ -2930,6 +3185,18 @@ mod tests {
         assert_eq!(offset_for_selection(77, 0, 100, 77), 1);
         assert_eq!(offset_for_selection(99, 1, 100, 77), 23);
         assert_eq!(offset_for_selection(22, 23, 100, 77), 22);
+    }
+
+    #[test]
+    fn relative_commit_ages_use_compact_stable_buckets() {
+        let now = 2_000_000_000;
+        assert_eq!(relative_commit_age(now, now), "now");
+        assert_eq!(relative_commit_age(now - 120, now), "2m");
+        assert_eq!(relative_commit_age(now - 7_200, now), "2h");
+        assert_eq!(relative_commit_age(now - 172_800, now), "2d");
+        assert_eq!(relative_commit_age(now - 1_209_600, now), "2w");
+        assert_eq!(relative_commit_age(now - 63_072_000, now), "2y");
+        assert_eq!(relative_commit_age(now + 60, now), "now");
     }
 
     #[test]

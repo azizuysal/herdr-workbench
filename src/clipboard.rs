@@ -30,6 +30,7 @@ impl From<io::Error> for ClipboardError {
 
 pub trait ClipboardWriter: Send + Sync {
     fn copy_path(&self, path: &Path) -> Result<(), ClipboardError>;
+    fn copy_text(&self, text: &str) -> Result<(), ClipboardError>;
 }
 
 pub struct HerdrClipboard;
@@ -38,6 +39,10 @@ impl ClipboardWriter for HerdrClipboard {
     fn copy_path(&self, path: &Path) -> Result<(), ClipboardError> {
         let stdout = io::stdout();
         write_osc52(&mut stdout.lock(), path.as_os_str().as_encoded_bytes()).map_err(Into::into)
+    }
+
+    fn copy_text(&self, text: &str) -> Result<(), ClipboardError> {
+        copy_text(text)
     }
 }
 
