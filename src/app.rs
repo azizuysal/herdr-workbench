@@ -2605,8 +2605,7 @@ mod tests {
         std::fs::write(directory.path().join("created.txt"), "created\n")
             .expect("write untracked file");
 
-        app.pending_refresh = Some(Instant::now() - REFRESH_DEBOUNCE);
-        app.poll_background();
+        app.refresh_git();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while app.git_receiver.is_some() && Instant::now() < deadline {
