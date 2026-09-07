@@ -26,8 +26,7 @@ use crate::decoration::{GitCoordinates, GitState};
 use crate::file_manager::{FileManagerOpener, SystemFileManagerOpener};
 use crate::file_tree::{FileTree, NodeKind};
 use crate::git::{
-    DirectoryStatus, GitCommit, GitEntry, GitError, GitSnapshot, GitStatusProvider,
-    SourceControlGroup, StatusCode,
+    DirectoryStatus, GitEntry, GitError, GitSnapshot, SourceControlGroup, StatusCode,
 };
 use crate::herdr::{
     CompanionEvent, CompanionMonitor, HerdrClient, InvocationContext, LiveHerdr,
@@ -43,6 +42,7 @@ use crate::search::{
 use crate::state::{GitContentMode, GitViewMode, PersistedState, SidebarState, SidebarView};
 use crate::theme::{Appearance, ThemeResolution};
 use crate::workspace::WorkspaceRoot;
+use crate::workspace_git::{RepositoryCommit, WorkspaceGitProvider, WorkspaceGitSnapshot};
 
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
@@ -224,7 +224,12 @@ struct ExplorerItem {
 
 #[derive(Debug, Clone)]
 enum SourceItem {
-    Header(SourceControlGroup, usize, bool),
+    Repository {
+        path: PathBuf,
+        name: String,
+        expanded: bool,
+    },
+    Header(SourceControlGroup, usize, bool, PathBuf),
     Directory {
         group: SourceControlGroup,
         path: PathBuf,
@@ -240,9 +245,10 @@ enum SourceItem {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceSelection {
-    Header(SourceControlGroup),
+    Repository(PathBuf),
+    Header(SourceControlGroup, PathBuf),
     Path(SourceControlGroup, PathBuf),
 }
 
@@ -267,12 +273,15 @@ struct SidebarApp {
     config: Config,
     editor: Option<OsString>,
     tree: FileTree,
-    git: GitStatusProvider,
+    git: WorkspaceGitProvider,
     git_snapshot: Option<GitSnapshot>,
-    git_receiver: Option<mpsc::Receiver<Result<GitSnapshot, GitError>>>,
+    git_repositories: Vec<GitSnapshot>,
+    git_receiver: Option<mpsc::Receiver<Result<WorkspaceGitSnapshot, GitError>>>,
+    git_refresh_pending: bool,
     git_error: Option<String>,
-    git_history: Vec<GitCommit>,
-    git_history_receiver: Option<mpsc::Receiver<Result<Vec<GitCommit>, GitError>>>,
+    git_history: Vec<RepositoryCommit>,
+    git_history_receiver: Option<mpsc::Receiver<Result<Vec<RepositoryCommit>, GitError>>>,
+    git_history_refresh_pending: bool,
     git_history_error: Option<String>,
     search: SearchProvider,
     search_handle: Option<SearchHandle>,
@@ -360,12 +369,10 @@ impl SidebarApp {
             SidebarView::SourceControl => View::SourceControl,
         };
         let (theme_path, theme, theme_modified) = theme_state;
-        let git = GitStatusProvider::new(workspace.path());
-        let git_receiver = workspace.is_git_worktree.then(|| git.refresh_async());
-        let git_history_receiver = (workspace.is_git_worktree
-            && saved.git_content_mode == GitContentMode::History)
-            .then(|| git.history_async());
-        let busy = git_receiver.is_some() || git_history_receiver.is_some();
+        let git = WorkspaceGitProvider::new(workspace.path());
+        let git_receiver = Some(git.refresh_async());
+        let git_history_receiver = None;
+        let busy = true;
         let search = SearchProvider::new(workspace.path());
         let (sender, receiver) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
@@ -395,10 +402,13 @@ impl SidebarApp {
             tree,
             git,
             git_snapshot: None,
+            git_repositories: Vec::new(),
             git_receiver,
+            git_refresh_pending: false,
             git_error: None,
             git_history: Vec::new(),
             git_history_receiver,
+            git_history_refresh_pending: false,
             git_history_error: None,
             search,
             search_handle: None,
@@ -449,7 +459,7 @@ impl SidebarApp {
         };
         RenderModel {
             view: self.view,
-            git_available: self.workspace.is_git_worktree,
+            git_available: !self.git_repositories.is_empty(),
             rows,
             offset: self.offset,
             icon_mode: match self.config.icons {
@@ -465,8 +475,11 @@ impl SidebarApp {
             },
             search_case_sensitive: self.search_query.case_sensitive,
             search_regex: self.search_query.mode == SearchMode::Regex,
-            notice: (self.view == View::SourceControl && !self.workspace.is_git_worktree)
-                .then(|| "No Git repository\nThis folder is not tracked by Git.".to_string()),
+            notice: (self.view == View::SourceControl
+                && self.git_repositories.is_empty()
+                && self.git_receiver.is_none()
+                && self.git_error.is_none())
+            .then(|| "No Git repositories\nNo repositories found in this folder.".to_string()),
             error: self
                 .error
                 .clone()
@@ -476,12 +489,12 @@ impl SidebarApp {
                         .flatten()
                 })
                 .or_else(|| {
-                    (self.view == View::SourceControl && self.workspace.is_git_worktree)
-                        .then(|| match self.git_content_mode {
-                            GitContentMode::Changes => self.git_error.clone(),
-                            GitContentMode::History => self.git_history_error.clone(),
-                        })
-                        .flatten()
+                    self.git_error.clone().or_else(|| {
+                        (self.view == View::SourceControl
+                            && self.git_content_mode == GitContentMode::History)
+                            .then(|| self.git_history_error.clone())
+                            .flatten()
+                    })
                 }),
             help: self.help,
             busy: self.busy,
@@ -612,43 +625,88 @@ impl SidebarApp {
     }
 
     fn source_items(&self) -> Vec<SourceItem> {
-        let Some(snapshot) = &self.git_snapshot else {
-            return Vec::new();
-        };
-        let groups = snapshot.groups();
         let mut items = Vec::new();
-        for group in [
-            SourceControlGroup::MergeChanges,
-            SourceControlGroup::StagedChanges,
-            SourceControlGroup::Changes,
-            SourceControlGroup::Untracked,
-        ] {
-            let entries = groups.get(&group).cloned().unwrap_or_default();
-            if entries.is_empty() && !self.config.show_empty_git_groups {
-                continue;
-            }
-            let expanded = !self.git_collapsed_groups.contains(source_group_key(group));
-            items.push(SourceItem::Header(group, entries.len(), expanded));
-            if !expanded {
-                continue;
-            }
-            match self.git_view_mode {
-                GitViewMode::Flat => {
-                    items.extend(entries.into_iter().cloned().map(|entry| SourceItem::Entry {
-                        group,
-                        name: entry.path.display().to_string(),
-                        entry: Box::new(entry),
-                        depth: 1,
-                    }));
+        for snapshot in &self.git_repositories {
+            let repository = snapshot
+                .root
+                .strip_prefix(self.workspace.path())
+                .expect("repository inside workspace");
+            let nested = !repository.as_os_str().is_empty();
+            if nested {
+                let expanded = !self
+                    .git_collapsed_groups
+                    .contains(&source_repository_key(repository));
+                let branch = snapshot.branch.name.as_deref().unwrap_or("detached HEAD");
+                items.push(SourceItem::Repository {
+                    path: repository.to_path_buf(),
+                    name: format!("{} · {branch}", repository.display()),
+                    expanded,
+                });
+                if !expanded {
+                    continue;
                 }
-                GitViewMode::Tree => append_source_tree_items(
-                    &mut items,
+            }
+            let projected = GitSnapshot {
+                entries: snapshot
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.path = repository.join(&entry.path);
+                        entry.rename_origin = entry.rename_origin.map(|path| repository.join(path));
+                        entry
+                    })
+                    .collect(),
+                ..GitSnapshot::default()
+            };
+            let groups = projected.groups();
+            for group in [
+                SourceControlGroup::MergeChanges,
+                SourceControlGroup::StagedChanges,
+                SourceControlGroup::Changes,
+                SourceControlGroup::Untracked,
+            ] {
+                let entries = groups.get(&group).cloned().unwrap_or_default();
+                if entries.is_empty() && !self.config.show_empty_git_groups {
+                    continue;
+                }
+                let expanded = !self
+                    .git_collapsed_groups
+                    .contains(&source_header_key(group, repository));
+                items.push(SourceItem::Header(
                     group,
-                    Path::new(""),
-                    &entries,
-                    1,
-                    &self.git_tree_expanded,
-                ),
+                    entries.len(),
+                    expanded,
+                    repository.to_path_buf(),
+                ));
+                if !expanded {
+                    continue;
+                }
+                match self.git_view_mode {
+                    GitViewMode::Flat => {
+                        items.extend(entries.into_iter().cloned().map(|entry| {
+                            SourceItem::Entry {
+                                group,
+                                name: entry
+                                    .path
+                                    .strip_prefix(repository)
+                                    .expect("repository entry")
+                                    .display()
+                                    .to_string(),
+                                entry: Box::new(entry),
+                                depth: 1 + u16::from(nested),
+                            }
+                        }));
+                    }
+                    GitViewMode::Tree => append_source_tree_items(
+                        &mut items,
+                        group,
+                        repository,
+                        &entries,
+                        1 + u16::from(nested),
+                        &self.git_tree_expanded,
+                    ),
+                }
             }
         }
         items
@@ -659,13 +717,27 @@ impl SidebarApp {
             .into_iter()
             .enumerate()
             .map(|(index, item)| match item {
-                SourceItem::Header(group, count, expanded) => RenderRow {
+                SourceItem::Repository {
+                    path,
+                    name,
+                    expanded,
+                } => RenderRow {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                    kind: EntryKind::Directory,
+                    git: self.git_coordinates(&path, NodeKind::Directory, false),
+                    expanded,
+                    depth: 0,
+                    selected: index == self.selection,
+                    focused: index == self.selection,
+                },
+                SourceItem::Header(group, count, expanded, repository) => RenderRow {
                     name: format!("{} ({count})", group_label(group)),
                     path: String::new(),
                     kind: EntryKind::Directory,
                     git: GitCoordinates::default(),
                     expanded,
-                    depth: 0,
+                    depth: u16::from(!repository.as_os_str().is_empty()),
                     selected: index == self.selection,
                     focused: index == self.selection,
                 },
@@ -713,20 +785,28 @@ impl SidebarApp {
         self.git_history
             .iter()
             .enumerate()
-            .map(|(index, commit)| RenderRow {
-                name: format!(
-                    "{} {} · {}",
-                    commit.short_oid,
-                    commit.summary,
-                    relative_commit_age(commit.timestamp, now)
-                ),
-                path: commit.oid.clone(),
-                kind: EntryKind::Commit,
-                git: GitCoordinates::default(),
-                expanded: false,
-                depth: 0,
-                selected: index == self.selection,
-                focused: index == self.selection,
+            .map(|(index, item)| {
+                let commit = &item.commit;
+                let repository = if item.repository.as_os_str().is_empty() {
+                    String::new()
+                } else {
+                    format!("{} · ", item.repository.display())
+                };
+                RenderRow {
+                    name: format!(
+                        "{repository}{} {} · {}",
+                        commit.short_oid,
+                        commit.summary,
+                        relative_commit_age(commit.timestamp, now)
+                    ),
+                    path: commit.oid.clone(),
+                    kind: EntryKind::Commit,
+                    git: GitCoordinates::default(),
+                    expanded: false,
+                    depth: 0,
+                    selected: index == self.selection,
+                    focused: index == self.selection,
+                }
             })
             .collect()
     }
@@ -1019,12 +1099,21 @@ impl SidebarApp {
                 self.preview_selected_source();
                 false
             }
-            Some(SourceItem::Header(group, _, expanded)) => {
+            Some(SourceItem::Repository { path, expanded, .. }) => {
+                let key = source_repository_key(&path);
                 if expanded {
-                    self.git_collapsed_groups
-                        .insert(source_group_key(group).to_string());
+                    self.git_collapsed_groups.insert(key);
                 } else {
-                    self.git_collapsed_groups.remove(source_group_key(group));
+                    self.git_collapsed_groups.remove(&key);
+                }
+                true
+            }
+            Some(SourceItem::Header(group, _, expanded, repository)) => {
+                let key = source_header_key(group, &repository);
+                if expanded {
+                    self.git_collapsed_groups.insert(key);
+                } else {
+                    self.git_collapsed_groups.remove(&key);
                 }
                 true
             }
@@ -1093,42 +1182,35 @@ impl SidebarApp {
     }
 
     fn selected_source(&self) -> Option<SourceSelection> {
-        match self.source_items().get(self.selection)? {
-            SourceItem::Header(group, _, _) => Some(SourceSelection::Header(*group)),
-            SourceItem::Directory { group, path, .. } => {
-                Some(SourceSelection::Path(*group, path.clone()))
-            }
-            SourceItem::Entry { group, entry, .. } => {
-                Some(SourceSelection::Path(*group, entry.path.clone()))
-            }
-        }
+        self.source_items()
+            .get(self.selection)
+            .map(source_item_selection)
+    }
+
+    fn source_repository(&self, path: &Path) -> Option<PathBuf> {
+        self.git_repositories.iter().find_map(|snapshot| {
+            let repository = snapshot.root.strip_prefix(self.workspace.path()).ok()?;
+            path.starts_with(repository)
+                .then(|| repository.to_path_buf())
+        })
     }
 
     fn restore_source_selection(&mut self, selected: Option<SourceSelection>) {
         let items = self.source_items();
         let exact = selected.as_ref().and_then(|selected| {
-            items.iter().position(|item| match (selected, item) {
-                (SourceSelection::Header(expected), SourceItem::Header(actual, _, _)) => {
-                    expected == actual
-                }
-                (
-                    SourceSelection::Path(expected_group, expected_path),
-                    SourceItem::Directory { group, path, .. },
-                ) => expected_group == group && expected_path == path,
-                (
-                    SourceSelection::Path(expected_group, expected_path),
-                    SourceItem::Entry { group, entry, .. },
-                ) => expected_group == group && expected_path == &entry.path,
-                _ => false,
-            })
+            items
+                .iter()
+                .position(|item| source_item_selection(item) == *selected)
         });
         let group_fallback = selected.and_then(|selected| {
-            let group = match selected {
-                SourceSelection::Header(group) | SourceSelection::Path(group, _) => group,
+            let (group, repository) = match selected {
+                SourceSelection::Repository(_) => return None,
+                SourceSelection::Header(group, repository) => (group, repository),
+                SourceSelection::Path(group, path) => (group, self.source_repository(&path)?),
             };
             items.iter().position(
-                |item| matches!(item, SourceItem::Header(actual, _, _) if *actual == group),
-            )
+                |item| matches!(item, SourceItem::Header(actual, _, _, root) if *actual == group && root == &repository),
+            ).or_else(|| items.iter().position(|item| matches!(item, SourceItem::Repository {path, ..} if path == &repository)))
         });
         self.selection = exact.or(group_fallback).unwrap_or(0);
         self.keep_selection_visible();
@@ -1139,10 +1221,19 @@ impl SidebarApp {
         let Some(item) = items.get(self.selection).cloned() else {
             return;
         };
-        if let SourceItem::Header(group, _, true) = item {
-            self.git_collapsed_groups
-                .insert(source_group_key(group).to_string());
-            self.persist_source_preferences();
+        if matches!(
+            item,
+            SourceItem::Header(_, _, true, _) | SourceItem::Repository { expanded: true, .. }
+        ) {
+            self.activate_source();
+            return;
+        }
+        if let SourceItem::Header(_, _, false, repository) = &item {
+            if let Some(index) = items.iter().position(
+                |item| matches!(item, SourceItem::Repository {path, ..} if path == repository),
+            ) {
+                self.selection = index;
+            }
             return;
         }
         if self.git_view_mode != GitViewMode::Tree {
@@ -1163,14 +1254,15 @@ impl SidebarApp {
         let (group, path) = match item {
             SourceItem::Directory { group, path, .. } => (group, path),
             SourceItem::Entry { group, entry, .. } => (group, entry.path.clone()),
-            SourceItem::Header(_, _, _) => return,
+            SourceItem::Header(..) | SourceItem::Repository { .. } => return,
         };
         let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        self.selection = if parent.as_os_str().is_empty() {
+        let repository = self.source_repository(&path);
+        self.selection = if repository.as_deref() == Some(parent) {
             items
                 .iter()
                 .position(
-                    |item| matches!(item, SourceItem::Header(actual, _, _) if *actual == group),
+                    |item| matches!(item, SourceItem::Header(actual, _, _, root) if *actual == group && Some(root) == repository.as_ref()),
                 )
                 .unwrap_or(self.selection)
         } else {
@@ -1213,14 +1305,25 @@ impl SidebarApp {
                     self.selection += 1;
                 }
             }
-            SourceItem::Header(group, _, expanded) => {
+            SourceItem::Repository { expanded, .. } => {
                 if !expanded {
-                    self.git_collapsed_groups.remove(source_group_key(group));
-                    self.persist_source_preferences();
+                    self.activate_source();
                 } else if items
                     .get(self.selection + 1)
-                    .is_some_and(|next| source_item_group(next) == group)
+                    .is_some_and(|item| source_item_depth(item) > 0)
                 {
+                    self.selection += 1;
+                }
+            }
+            SourceItem::Header(group, _, expanded, repository) => {
+                if !expanded {
+                    self.git_collapsed_groups
+                        .remove(&source_header_key(group, &repository));
+                    self.persist_source_preferences();
+                } else if items.get(self.selection + 1).is_some_and(|next| {
+                    source_item_group(next) == Some(group)
+                        && source_item_depth(next) > u16::from(!repository.as_os_str().is_empty())
+                }) {
                     self.selection += 1;
                 }
             }
@@ -1412,6 +1515,7 @@ impl SidebarApp {
 
     fn copy_selected_source_path(&mut self) {
         let path = match self.source_items().get(self.selection) {
+            Some(SourceItem::Repository { path, .. }) => Some(path.clone()),
             Some(SourceItem::Directory { path, .. }) => Some(path.clone()),
             Some(SourceItem::Entry { entry, .. }) => Some(entry.path.clone()),
             _ => None,
@@ -1425,7 +1529,7 @@ impl SidebarApp {
         let oid = self
             .git_history
             .get(self.selection)
-            .map(|commit| commit.oid.clone());
+            .map(|item| item.commit.oid.clone());
         if let Some(oid) = oid
             && let Err(error) = self.clipboard.copy_text(&oid)
         {
@@ -1477,6 +1581,7 @@ impl SidebarApp {
 
     fn reveal_selected_source(&mut self) {
         let path = match self.source_items().get(self.selection) {
+            Some(SourceItem::Repository { path, .. }) => Some(path.clone()),
             Some(SourceItem::Directory { path, .. }) => Some(path.clone()),
             Some(SourceItem::Entry { entry, .. }) => Some(entry.path.clone()),
             _ => None,
@@ -1568,18 +1673,21 @@ impl SidebarApp {
             return;
         };
         self.open_preview(PreviewRequest::Source {
+            repository: self
+                .source_repository(&entry.path)
+                .expect("source repository"),
             path: entry.path,
             group,
         });
     }
 
     fn preview_selected_commit(&mut self) {
-        let oid = self
-            .git_history
-            .get(self.selection)
-            .map(|commit| commit.oid.clone());
-        if let Some(oid) = oid {
-            self.open_preview(PreviewRequest::Commit { oid });
+        let commit = self.git_history.get(self.selection).cloned();
+        if let Some(item) = commit {
+            self.open_preview(PreviewRequest::Commit {
+                repository: item.repository,
+                oid: item.commit.oid,
+            });
         }
     }
 
@@ -1618,30 +1726,22 @@ impl SidebarApp {
     }
 
     fn refresh_git(&mut self) {
-        if !self.workspace.is_git_worktree {
-            match self.workspace.refresh_git_worktree() {
-                Ok(true) => self.git_error = None,
-                Ok(false) => return,
-                Err(error) => {
-                    self.error = Some(format!("Cannot detect Git repository\n{error}"));
-                    return;
-                }
-            }
-        }
         if self.git_receiver.is_none() {
             self.git_receiver = Some(self.git.refresh_async());
+        } else {
+            self.git_refresh_pending = true;
         }
-        self.refresh_history();
         self.update_busy();
     }
 
     fn refresh_history(&mut self) {
-        if self.workspace.is_git_worktree
-            && self.git_content_mode == GitContentMode::History
-            && self.git_history_receiver.is_none()
-        {
-            self.git_history_receiver = Some(self.git.history_async());
-            self.git_history_error = None;
+        if self.git_content_mode == GitContentMode::History && self.git_receiver.is_none() {
+            if self.git_history_receiver.is_none() {
+                self.git_history_receiver = Some(self.git.history_async());
+                self.git_history_error = None;
+            } else {
+                self.git_history_refresh_pending = true;
+            }
         }
     }
 
@@ -1667,7 +1767,9 @@ impl SidebarApp {
         if let Some(result) = git_result {
             self.git_receiver = None;
             match result {
-                Ok(snapshot) => {
+                Ok(result) => {
+                    let selected = self.selected_source();
+                    let snapshot = result.combined;
                     let ignored = snapshot
                         .entries
                         .iter()
@@ -1677,6 +1779,11 @@ impl SidebarApp {
                     self.tree.set_ignored_paths(ignored);
                     self.tree.refresh();
                     self.git_snapshot = Some(snapshot);
+                    self.git_repositories = result.repositories;
+                    self.workspace.is_git_worktree = self
+                        .git_repositories
+                        .iter()
+                        .any(|repository| repository.root == self.workspace.path());
                     if self.git_view_mode == GitViewMode::Tree {
                         let initialized = self.git_tree_initialized;
                         self.initialize_git_tree();
@@ -1684,7 +1791,22 @@ impl SidebarApp {
                             self.persist_source_preferences();
                         }
                     }
-                    self.git_error = None;
+                    self.git_error = (!result.errors.is_empty()).then(|| {
+                        format!(
+                            "Git status incomplete\n{}",
+                            result
+                                .errors
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    });
+                    if self.view == View::SourceControl
+                        && self.git_content_mode == GitContentMode::Changes
+                    {
+                        self.restore_source_selection(selected);
+                    }
                 }
                 Err(error) => {
                     let detail = error
@@ -1694,9 +1816,15 @@ impl SidebarApp {
                         .unwrap_or("Git returned no diagnostic")
                         .trim();
                     self.git_error = Some(format!(
-                        "Git status unavailable\n{detail}\nLast valid status retained. Run git status in the workspace root."
+                        "Git status unavailable\n{detail}\nLast valid status retained."
                     ))
                 }
+            }
+            if self.git_refresh_pending {
+                self.git_refresh_pending = false;
+                self.refresh_git();
+            } else {
+                self.refresh_history();
             }
         }
 
@@ -1719,9 +1847,13 @@ impl SidebarApp {
                         .unwrap_or("Git returned no diagnostic")
                         .trim();
                     self.git_history_error = Some(format!(
-                        "Git history unavailable\n{detail}\nLast valid history retained. Run git log in the workspace root."
+                        "Git history unavailable\n{detail}\nLast valid history retained."
                     ));
                 }
+            }
+            if self.git_history_refresh_pending {
+                self.git_history_refresh_pending = false;
+                self.refresh_history();
             }
         }
 
@@ -2193,17 +2325,46 @@ fn source_group_key(group: SourceControlGroup) -> &'static str {
     }
 }
 
-fn source_item_group(item: &SourceItem) -> SourceControlGroup {
+fn source_repository_key(repository: &Path) -> String {
+    format!("repository\0{}", repository.to_string_lossy())
+}
+
+fn source_header_key(group: SourceControlGroup, repository: &Path) -> String {
+    if repository.as_os_str().is_empty() {
+        source_group_key(group).to_string()
+    } else {
+        format!(
+            "{}\0{}",
+            source_repository_key(repository),
+            source_group_key(group)
+        )
+    }
+}
+
+fn source_item_selection(item: &SourceItem) -> SourceSelection {
     match item {
-        SourceItem::Header(group, _, _)
+        SourceItem::Repository { path, .. } => SourceSelection::Repository(path.clone()),
+        SourceItem::Header(group, _, _, repository) => {
+            SourceSelection::Header(*group, repository.clone())
+        }
+        SourceItem::Directory { group, path, .. } => SourceSelection::Path(*group, path.clone()),
+        SourceItem::Entry { group, entry, .. } => SourceSelection::Path(*group, entry.path.clone()),
+    }
+}
+
+fn source_item_group(item: &SourceItem) -> Option<SourceControlGroup> {
+    match item {
+        SourceItem::Repository { .. } => None,
+        SourceItem::Header(group, _, _, _)
         | SourceItem::Directory { group, .. }
-        | SourceItem::Entry { group, .. } => *group,
+        | SourceItem::Entry { group, .. } => Some(*group),
     }
 }
 
 fn source_item_depth(item: &SourceItem) -> u16 {
     match item {
-        SourceItem::Header(_, _, _) => 0,
+        SourceItem::Repository { .. } => 0,
+        SourceItem::Header(_, _, _, repository) => u16::from(!repository.as_os_str().is_empty()),
         SourceItem::Directory { depth, .. } | SourceItem::Entry { depth, .. } => *depth,
     }
 }
@@ -2334,9 +2495,29 @@ mod tests {
         }
     }
 
+    fn wait_for_git(app: &mut SidebarApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (app.git_receiver.is_some() || app.git_history_receiver.is_some())
+            && Instant::now() < deadline
+        {
+            app.poll_background();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.git_receiver.is_none(), "Git discovery did not finish");
+        assert!(
+            app.git_history_receiver.is_none(),
+            "Git history did not finish"
+        );
+    }
+
     fn test_app() -> (tempfile::TempDir, SidebarApp) {
+        test_app_with_setup(|_| {})
+    }
+
+    fn test_app_with_setup(setup: impl FnOnce(&Path)) -> (tempfile::TempDir, SidebarApp) {
         let directory = tempfile::tempdir().expect("temporary workspace");
         std::fs::write(directory.path().join("child.txt"), "child\n").expect("workspace child");
+        setup(directory.path());
         let workspace = WorkspaceRoot::resolve(directory.path()).expect("workspace root");
         let config_path = directory.path().join("config.toml");
         let state_path = directory.path().join("state.json");
@@ -2744,29 +2925,32 @@ mod tests {
     }
 
     #[test]
-    fn non_git_workspace_never_starts_git_and_renders_a_quiet_notice() {
+    fn non_git_workspace_finishes_discovery_and_renders_a_quiet_notice() {
         let (_directory, mut app) = test_app();
 
         assert!(!app.workspace.is_git_worktree);
+        wait_for_git(&mut app);
         assert!(app.git_receiver.is_none());
         assert!(!app.busy);
 
         app.switch_view(View::SourceControl);
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
             .expect("refresh non-Git workspace");
+        wait_for_git(&mut app);
         let model = app.render_model();
 
         assert!(app.git_receiver.is_none());
         assert!(app.git_error.is_none());
         assert_eq!(
             model.notice.as_deref(),
-            Some("No Git repository\nThis folder is not tracked by Git.")
+            Some("No Git repositories\nNo repositories found in this folder.")
         );
     }
 
     #[test]
     fn source_control_detects_repository_initialized_after_startup() {
         let (directory, mut app) = test_app();
+        wait_for_git(&mut app);
         app.switch_view(View::SourceControl);
         assert!(!app.workspace.is_git_worktree);
 
@@ -2803,6 +2987,169 @@ mod tests {
                 SourceItem::Entry { entry, .. } if entry.path == Path::new("created.txt")
             )
         }));
+    }
+
+    fn fixture_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("fixture Git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn create_nested_fixture(root: &Path, name: &str) {
+        let repository = root.join(name);
+        std::fs::create_dir_all(&repository).unwrap();
+        fixture_git(&repository, &["init", "-q", "-b", "main"]);
+        fixture_git(&repository, &["config", "user.name", "Fixture"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(repository.join("same.txt"), "base\n").unwrap();
+        std::fs::write(repository.join(".gitignore"), "ignored/\n").unwrap();
+        fixture_git(&repository, &["add", "."]);
+        fixture_git(&repository, &["commit", "-qm", name]);
+        std::fs::write(repository.join("same.txt"), "staged\n").unwrap();
+        fixture_git(&repository, &["add", "same.txt"]);
+        std::fs::write(repository.join("same.txt"), "worktree\n").unwrap();
+        std::fs::create_dir(repository.join("ignored")).unwrap();
+        std::fs::write(repository.join("ignored/cache.txt"), "ignored\n").unwrap();
+    }
+
+    #[test]
+    fn parent_workspace_shows_each_repository_and_decorates_its_explorer_files() {
+        let (_directory, mut app) = test_app_with_setup(|root| {
+            create_nested_fixture(root, "first");
+            create_nested_fixture(root, "second");
+        });
+        wait_for_git(&mut app);
+        assert!(!app.workspace.is_git_worktree);
+        assert!(app.git_error.is_none());
+        assert!(app.render_model().git_available);
+        for name in ["first", "second"] {
+            app.tree.expand(Path::new(name)).unwrap();
+            app.tree.expand(&Path::new(name).join("ignored")).unwrap();
+            let rows = app.explorer_rows();
+            let file = rows
+                .iter()
+                .find(|row| row.path == format!("{name}/same.txt"))
+                .unwrap();
+            assert_eq!(file.git.index, GitState::Modified);
+            assert_eq!(file.git.worktree, GitState::Modified);
+            let folder = rows.iter().find(|row| row.path == name).unwrap();
+            assert_eq!(folder.git.aggregate(), GitState::Modified);
+            let ignored = rows
+                .iter()
+                .find(|row| row.path == format!("{name}/ignored/cache.txt"))
+                .unwrap();
+            assert_eq!(ignored.git.worktree, GitState::Ignored);
+        }
+        app.view = View::SourceControl;
+        let rows = app.source_rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.depth == 0)
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first · main", "second · main"]
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.path == "first/same.txt")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.path == "second/same.txt")
+                .count(),
+            2
+        );
+
+        app.selection = 1;
+        app.activate_source();
+        assert!(app.git_collapsed_groups.contains(&source_header_key(
+            SourceControlGroup::StagedChanges,
+            Path::new("first")
+        )));
+        assert!(!app.git_collapsed_groups.contains(&source_header_key(
+            SourceControlGroup::StagedChanges,
+            Path::new("second")
+        )));
+        app.selection = 0;
+        app.activate_source();
+        assert!(
+            !app.source_rows()
+                .iter()
+                .any(|row| row.path == "first/same.txt")
+        );
+        assert!(
+            app.source_rows()
+                .iter()
+                .any(|row| row.path == "second/same.txt")
+        );
+        app.expand_or_source_child();
+        app.expand_or_source_child();
+        assert!(
+            matches!(app.selected_source(), Some(SourceSelection::Header(_, root)) if root == Path::new("first"))
+        );
+
+        let previews = RecordingPreviewOpener::default();
+        app.preview_opener = Box::new(previews.clone());
+        app.selection = app.source_items().iter().position(|item| matches!(item, SourceItem::Entry { group: SourceControlGroup::Changes, entry, .. } if entry.path == Path::new("second/same.txt"))).unwrap();
+        app.toggle_git_view();
+        app.preview_selected_source();
+        assert_eq!(
+            *previews.requests.lock().unwrap(),
+            vec![PreviewRequest::Source {
+                repository: "second".into(),
+                path: "second/same.txt".into(),
+                group: SourceControlGroup::Changes,
+            }]
+        );
+        app.collapse_or_source_parent();
+        assert_eq!(
+            app.selected_source(),
+            Some(SourceSelection::Header(
+                SourceControlGroup::Changes,
+                "second".into()
+            ))
+        );
+
+        app.toggle_git_content_mode();
+        wait_for_git(&mut app);
+        assert!(app.git_history_error.is_none());
+        assert_eq!(app.history_rows().len(), 2);
+        assert!(app.history_rows()[1].name.starts_with("second · "));
+        app.selection = 1;
+        app.preview_selected_commit();
+        assert!(
+            matches!(previews.requests.lock().unwrap().last(), Some(PreviewRequest::Commit { repository, .. }) if repository == Path::new("second"))
+        );
+    }
+
+    #[test]
+    fn a_refresh_during_discovery_keeps_new_repository_state() {
+        let (directory, mut app) = test_app();
+        // The initial refresh may finish before the repository exists, but is not consumed yet.
+        create_nested_fixture(directory.path(), "added");
+        app.refresh_git();
+        wait_for_git(&mut app);
+        assert_eq!(app.git_repositories.len(), 1);
+        assert!(app.git_error.is_none());
+        std::fs::remove_dir_all(directory.path().join("added")).unwrap();
+        app.refresh_git();
+        wait_for_git(&mut app);
+        assert!(app.git_repositories.is_empty());
+        assert!(app.git_snapshot.as_ref().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -2860,6 +3207,7 @@ mod tests {
             }],
             ..GitSnapshot::default()
         });
+        app.git_repositories = vec![app.git_snapshot.clone().expect("fixture snapshot")];
         app.view = View::SourceControl;
         app.selection = 3;
 
@@ -2869,6 +3217,7 @@ mod tests {
         assert_eq!(
             *previews.requests.lock().expect("preview requests"),
             vec![PreviewRequest::Source {
+                repository: PathBuf::new(),
                 path: PathBuf::from("dual.rs"),
                 group: SourceControlGroup::Changes,
             }]
@@ -2902,11 +3251,14 @@ mod tests {
         app.clipboard = Box::new(clipboard.clone());
         app.view = View::SourceControl;
         app.git_content_mode = GitContentMode::History;
-        app.git_history = vec![GitCommit {
-            oid: "a".repeat(40),
-            short_oid: "aaaaaaa".to_string(),
-            timestamp: 1_700_000_000,
-            summary: "add history".to_string(),
+        app.git_history = vec![RepositoryCommit {
+            repository: PathBuf::new(),
+            commit: crate::git::GitCommit {
+                oid: "a".repeat(40),
+                short_oid: "aaaaaaa".to_string(),
+                timestamp: 1_700_000_000,
+                summary: "add history".to_string(),
+            },
         }];
 
         app.handle_source_key(KeyCode::Char(' '))
@@ -2917,6 +3269,7 @@ mod tests {
         assert_eq!(
             *previews.requests.lock().expect("preview requests"),
             vec![PreviewRequest::Commit {
+                repository: PathBuf::new(),
                 oid: "a".repeat(40)
             }]
         );
@@ -2984,6 +3337,7 @@ mod tests {
             }],
             ..GitSnapshot::default()
         });
+        app.git_repositories = vec![app.git_snapshot.clone().expect("fixture snapshot")];
         app.workspace.is_git_worktree = true;
         app.view = View::SourceControl;
 
@@ -3075,6 +3429,7 @@ mod tests {
             ],
             ..GitSnapshot::default()
         });
+        app.git_repositories = vec![app.git_snapshot.clone().expect("fixture snapshot")];
         app.view = View::SourceControl;
         app.selection = 3;
 
@@ -3141,6 +3496,7 @@ mod tests {
             }],
             ..GitSnapshot::default()
         });
+        app.git_repositories = vec![app.git_snapshot.clone().expect("fixture snapshot")];
 
         app.handle_source_key(KeyCode::Char('v'))
             .expect("toggle and persist source view");

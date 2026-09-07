@@ -69,6 +69,25 @@ impl WorkspaceRoot {
             is_git_worktree: false,
         })
     }
+
+    /// Creates an immutable workspace boundary at this exact directory.
+    ///
+    /// Unlike `resolve`, this never promotes the boundary to an ancestor Git
+    /// worktree. This is used for paths received from an already-running pane.
+    pub fn from_directory(directory: &Path) -> Result<Self, WorkspaceError> {
+        let root = directory
+            .canonicalize()
+            .map_err(|source| WorkspaceError::Canonicalize {
+                path: directory.to_owned(),
+                source,
+            })?;
+        let is_git_worktree =
+            git_worktree_root(&root)?.is_some_and(|worktree_root| worktree_root == root);
+        Ok(Self {
+            root,
+            is_git_worktree,
+        })
+    }
     pub fn from_current_dir() -> Result<Self, WorkspaceError> {
         let cwd = std::env::current_dir().map_err(WorkspaceError::CurrentDirectory)?;
         Self::resolve(&cwd)
@@ -197,4 +216,30 @@ fn git_worktree_root(cwd: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
             source,
         })?;
     Ok(Some(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_directory_does_not_broaden_to_an_ancestor_worktree() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let output = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .output()
+            .expect("run git");
+        assert!(output.status.success());
+        let nested = repository.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested directory");
+
+        let workspace = WorkspaceRoot::from_directory(&nested).expect("exact workspace");
+
+        assert_eq!(
+            workspace.path(),
+            nested.canonicalize().as_deref().expect("canonical")
+        );
+        assert!(!workspace.is_git_worktree);
+    }
 }

@@ -42,6 +42,7 @@ const PATH_ENV: &str = "HERDR_WORKBENCH_PREVIEW_PATH";
 const LINE_ENV: &str = "HERDR_WORKBENCH_PREVIEW_LINE";
 const GROUP_ENV: &str = "HERDR_WORKBENCH_PREVIEW_GROUP";
 const OID_ENV: &str = "HERDR_WORKBENCH_PREVIEW_OID";
+const REPOSITORY_ENV: &str = "HERDR_WORKBENCH_PREVIEW_REPOSITORY";
 const MAX_VISUAL_ZOOM: u8 = 5;
 const VISUAL_PAN_STEP: i64 = 8;
 const VISUAL_WHEEL_STEP: i64 = 24;
@@ -53,10 +54,12 @@ pub enum PreviewRequest {
         line: Option<usize>,
     },
     Source {
+        repository: PathBuf,
         path: PathBuf,
         group: SourceControlGroup,
     },
     Commit {
+        repository: PathBuf,
         oid: String,
     },
 }
@@ -111,13 +114,19 @@ impl<C: HerdrClient> PreviewOpener for HerdrPreviewOpener<C> {
                     request_env.insert(LINE_ENV.to_string(), line.to_string());
                 }
             }
-            PreviewRequest::Source { path, group } => {
+            PreviewRequest::Source {
+                repository,
+                path,
+                group,
+            } => {
                 request_env.insert(KIND_ENV.to_string(), "source".to_string());
+                request_env.insert(REPOSITORY_ENV.to_string(), encode_path(repository));
                 request_env.insert(PATH_ENV.to_string(), encode_path(path));
                 request_env.insert(GROUP_ENV.to_string(), encode_group(*group).to_string());
             }
-            PreviewRequest::Commit { oid } => {
+            PreviewRequest::Commit { repository, oid } => {
                 request_env.insert(KIND_ENV.to_string(), "commit".to_string());
+                request_env.insert(REPOSITORY_ENV.to_string(), encode_path(repository));
                 request_env.insert(OID_ENV.to_string(), oid.clone());
             }
         }
@@ -169,16 +178,18 @@ impl PreviewInvocation {
                     .transpose()?,
             },
             "source" => PreviewRequest::Source {
+                repository: decode_path(&required_env(REPOSITORY_ENV)?)?,
                 path: decode_path(&required_env(PATH_ENV)?)?,
                 group: decode_group(&required_env(GROUP_ENV)?)?,
             },
             "commit" => PreviewRequest::Commit {
+                repository: decode_path(&required_env(REPOSITORY_ENV)?)?,
                 oid: required_env(OID_ENV)?,
             },
             kind => return Err(PreviewError::new(format!("invalid preview kind {kind:?}"))),
         };
-        let workspace =
-            WorkspaceRoot::resolve(&root).map_err(|error| PreviewError::new(error.to_string()))?;
+        let workspace = WorkspaceRoot::from_directory(&root)
+            .map_err(|error| PreviewError::new(error.to_string()))?;
         Ok(Self { workspace, request })
     }
 }
@@ -374,20 +385,25 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                 numbered_line_range,
             })
         }
-        PreviewRequest::Source { path, group } => {
-            if !invocation.workspace.is_git_worktree {
-                return Err(PreviewError::new(
-                    "Source Control preview requires a Git worktree",
-                ));
-            }
-            let provider = GitStatusProvider::new(invocation.workspace.path());
+        PreviewRequest::Source {
+            repository,
+            path,
+            group,
+        } => {
+            let repository_workspace = resolve_repository(&invocation.workspace, repository)?;
+            invocation
+                .workspace
+                .resolve_path(path)
+                .map_err(|error| PreviewError::new(error.to_string()))?;
+            let repository_path = path_in_repository(path, repository)?;
+            let provider = GitStatusProvider::new(repository_workspace.path());
             let snapshot = provider
                 .refresh()
                 .map_err(|error| PreviewError::new(error.to_string()))?;
             let groups = snapshot.groups();
             let entry = groups
                 .get(group)
-                .and_then(|entries| entries.iter().find(|entry| entry.path == *path))
+                .and_then(|entries| entries.iter().find(|entry| entry.path == repository_path))
                 .ok_or_else(|| {
                     PreviewError::new(format!(
                         "{} is no longer present in {}",
@@ -463,11 +479,9 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
                 numbered_line_range,
             })
         }
-        PreviewRequest::Commit { oid } => {
-            if !invocation.workspace.is_git_worktree {
-                return Err(PreviewError::new("Commit preview requires a Git worktree"));
-            }
-            let provider = GitStatusProvider::new(invocation.workspace.path());
+        PreviewRequest::Commit { repository, oid } => {
+            let repository_workspace = resolve_repository(&invocation.workspace, repository)?;
+            let provider = GitStatusProvider::new(repository_workspace.path());
             let preview = provider
                 .commit_preview(oid)
                 .map_err(|error| PreviewError::new(error.to_string()))?;
@@ -488,17 +502,58 @@ fn load_document(invocation: &PreviewInvocation) -> Result<PreviewDocument, Prev
 fn request_title(request: &PreviewRequest) -> String {
     match request {
         PreviewRequest::File { path, .. } => sanitize_terminal(&path.display().to_string()),
-        PreviewRequest::Source { path, group } => {
+        PreviewRequest::Source { path, group, .. } => {
             format!(
                 "{} · {}",
                 group_label(*group),
                 sanitize_terminal(&path.display().to_string())
             )
         }
-        PreviewRequest::Commit { oid } => {
-            format!("Commit {}", oid.get(..oid.len().min(12)).unwrap_or(oid))
+        PreviewRequest::Commit { repository, oid } => {
+            let commit = format!("Commit {}", oid.get(..oid.len().min(12)).unwrap_or(oid));
+            if repository.as_os_str().is_empty() {
+                commit
+            } else {
+                format!(
+                    "{commit} · {}",
+                    sanitize_terminal(&repository.display().to_string())
+                )
+            }
         }
     }
+}
+
+fn resolve_repository(
+    workspace: &WorkspaceRoot,
+    repository: &Path,
+) -> Result<WorkspaceRoot, PreviewError> {
+    let path = workspace
+        .resolve_path(repository)
+        .map_err(|error| PreviewError::new(error.to_string()))?;
+    let repository = WorkspaceRoot::from_directory(&path)
+        .map_err(|error| PreviewError::new(error.to_string()))?;
+    if repository.is_git_worktree {
+        Ok(repository)
+    } else {
+        Err(PreviewError::new(
+            "Source Control preview repository must be a Git worktree root",
+        ))
+    }
+}
+
+fn path_in_repository(path: &Path, repository: &Path) -> Result<PathBuf, PreviewError> {
+    if repository.as_os_str().is_empty() {
+        return Ok(path.to_owned());
+    }
+    path.strip_prefix(repository)
+        .map(Path::to_owned)
+        .map_err(|_| {
+            PreviewError::new(format!(
+                "{} is outside repository {}",
+                path.display(),
+                repository.display()
+            ))
+        })
 }
 
 fn plain_content(text: &str, role: HighlightRole) -> PreviewContent {
@@ -1680,20 +1735,50 @@ mod tests {
     }
 
     #[test]
-    fn commit_opener_passes_only_the_validated_object_id_payload() {
+    fn source_and_commit_openers_pass_repository_payloads() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         let workspace = WorkspaceRoot::resolve(directory.path()).expect("workspace");
-        let opener = HerdrPreviewOpener::new(FakeHerdr::new([Ok(serde_json::json!({}))]));
+        let opener = HerdrPreviewOpener::new(FakeHerdr::new([
+            Ok(serde_json::json!({})),
+            Ok(serde_json::json!({})),
+        ]));
         let oid = "a".repeat(40);
 
         opener
-            .open(&workspace, &PreviewRequest::Commit { oid: oid.clone() })
+            .open(
+                &workspace,
+                &PreviewRequest::Source {
+                    repository: PathBuf::from("nested-repository"),
+                    path: PathBuf::from("nested-repository/notes.txt"),
+                    group: SourceControlGroup::Changes,
+                },
+            )
+            .expect("open source popup");
+
+        opener
+            .open(
+                &workspace,
+                &PreviewRequest::Commit {
+                    repository: PathBuf::from("nested-repository"),
+                    oid: oid.clone(),
+                },
+            )
             .expect("open commit popup");
 
         let calls = opener.client.calls();
-        assert_eq!(calls[0].1["env"][KIND_ENV], "commit");
-        assert_eq!(calls[0].1["env"][OID_ENV], oid);
-        assert!(calls[0].1["env"].get(PATH_ENV).is_none());
+        assert_eq!(calls[0].1["env"][KIND_ENV], "source");
+        assert_eq!(calls[0].1["env"][GROUP_ENV], "changes");
+        assert_eq!(
+            decode_path(calls[0].1["env"][REPOSITORY_ENV].as_str().unwrap()).unwrap(),
+            Path::new("nested-repository")
+        );
+        assert_eq!(calls[1].1["env"][KIND_ENV], "commit");
+        assert_eq!(calls[1].1["env"][OID_ENV], oid);
+        assert_eq!(
+            decode_path(calls[1].1["env"][REPOSITORY_ENV].as_str().unwrap()).unwrap(),
+            Path::new("nested-repository")
+        );
+        assert!(calls[1].1["env"].get(PATH_ENV).is_none());
     }
 
     #[test]
@@ -1720,7 +1805,10 @@ mod tests {
             .to_string();
         let invocation = PreviewInvocation {
             workspace: WorkspaceRoot::resolve(directory.path()).expect("workspace"),
-            request: PreviewRequest::Commit { oid: oid.clone() },
+            request: PreviewRequest::Commit {
+                repository: PathBuf::new(),
+                oid: oid.clone(),
+            },
         };
 
         let document = load_document(&invocation).expect("commit preview");
@@ -1731,6 +1819,145 @@ mod tests {
         assert!(text.contains("notes.txt | 1 +"));
         assert!(text.contains("+committed"));
         assert_eq!(document.numbered_line_range, None);
+    }
+
+    #[test]
+    fn source_and_commit_previews_use_the_requested_nested_repository() {
+        let workspace_directory = tempfile::tempdir().expect("temporary workspace");
+        let create_repository = |name: &str, content: &str, subject: &str| {
+            let repository = workspace_directory.path().join(name);
+            std::fs::create_dir(&repository).expect("create repository");
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repository)
+                    .output()
+                    .expect("run git");
+                assert!(output.status.success(), "git {args:?}");
+                output.stdout
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "test@example.invalid"]);
+            git(&["config", "user.name", "Test"]);
+            std::fs::write(repository.join("same.txt"), "base\n").expect("fixture");
+            git(&["add", "same.txt"]);
+            git(&["commit", "-qm", subject]);
+            std::fs::write(repository.join("same.txt"), content).expect("fixture");
+            repository
+        };
+        let repository_a = create_repository("repository-a", "staged in a\n", "commit in a");
+        let repository_b = create_repository("repository-b", "worktree in b\n", "commit in b");
+        let git_a = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository_a)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?}");
+            output.stdout
+        };
+        git_a(&["add", "same.txt"]);
+        let oid = String::from_utf8(git_a(&["rev-parse", "HEAD"]))
+            .expect("UTF-8 oid")
+            .trim()
+            .to_string();
+        let workspace =
+            WorkspaceRoot::from_directory(workspace_directory.path()).expect("workspace");
+
+        let staged = load_document(&PreviewInvocation {
+            workspace: workspace.clone(),
+            request: PreviewRequest::Source {
+                repository: PathBuf::from("repository-a"),
+                path: PathBuf::from("repository-a/same.txt"),
+                group: SourceControlGroup::StagedChanges,
+            },
+        })
+        .expect("staged preview");
+        let worktree = load_document(&PreviewInvocation {
+            workspace: workspace.clone(),
+            request: PreviewRequest::Source {
+                repository: PathBuf::from("repository-b"),
+                path: PathBuf::from("repository-b/same.txt"),
+                group: SourceControlGroup::Changes,
+            },
+        })
+        .expect("worktree preview");
+        let commit = load_document(&PreviewInvocation {
+            workspace,
+            request: PreviewRequest::Commit {
+                repository: PathBuf::from("repository-a"),
+                oid: oid.clone(),
+            },
+        })
+        .expect("commit preview");
+
+        assert!(staged.content.plain_text().contains("+staged in a"));
+        assert!(!staged.content.plain_text().contains("worktree in b"));
+        assert!(worktree.content.plain_text().contains("+worktree in b"));
+        assert!(!worktree.content.plain_text().contains("staged in a"));
+        assert!(commit.content.plain_text().contains("commit in a"));
+        assert!(!commit.content.plain_text().contains("commit in b"));
+        assert_eq!(
+            commit.title,
+            format!("Commit {} · repository-a", &oid[..12])
+        );
+        let _ = repository_b;
+    }
+
+    #[test]
+    fn repository_preview_rejects_paths_outside_its_exact_worktree_root() {
+        let workspace_directory = tempfile::tempdir().expect("temporary workspace");
+        let repository = workspace_directory.path().join("repository");
+        std::fs::create_dir(&repository).expect("create repository");
+        let output = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .output()
+            .expect("run git");
+        assert!(output.status.success());
+        let workspace =
+            WorkspaceRoot::from_directory(workspace_directory.path()).expect("workspace");
+
+        assert!(resolve_repository(&workspace, Path::new("repository")).is_ok());
+        assert!(resolve_repository(&workspace, Path::new("repository/.git")).is_err());
+        assert!(resolve_repository(&workspace, Path::new("../repository")).is_err());
+        assert!(resolve_repository(&workspace, Path::new("/tmp/repository")).is_err());
+        assert!(path_in_repository(Path::new("other/file.txt"), Path::new("repository")).is_err());
+        for path in [
+            PathBuf::from("../outside.txt"),
+            PathBuf::from("/tmp/outside.txt"),
+            PathBuf::from("other/file.txt"),
+        ] {
+            assert!(
+                load_document(&PreviewInvocation {
+                    workspace: workspace.clone(),
+                    request: PreviewRequest::Source {
+                        repository: PathBuf::from("repository"),
+                        path,
+                        group: SourceControlGroup::Changes,
+                    },
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_preview_rejects_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_directory = tempfile::tempdir().expect("temporary workspace");
+        let outside_directory = tempfile::tempdir().expect("outside workspace");
+        symlink(
+            outside_directory.path(),
+            workspace_directory.path().join("escape"),
+        )
+        .expect("symlink");
+        let workspace =
+            WorkspaceRoot::from_directory(workspace_directory.path()).expect("workspace");
+
+        assert!(resolve_repository(&workspace, Path::new("escape")).is_err());
     }
 
     #[test]

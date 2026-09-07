@@ -17,6 +17,7 @@ pub mod state;
 pub mod system_preview;
 pub mod theme;
 pub mod workspace;
+pub mod workspace_git;
 
 pub const PLUGIN_ID: &str = "herdr-workbench";
 pub const SIDEBAR_ENTRYPOINT: &str = "sidebar";

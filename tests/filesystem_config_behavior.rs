@@ -215,11 +215,17 @@ fn initial_large_tree_render_does_not_visit_ten_thousand_files() {
 }
 
 #[test]
-fn root_git_directory_is_hidden_by_default_and_can_be_shown() {
+fn git_metadata_at_every_depth_is_hidden_by_default_and_can_be_shown() {
     let fixture = TempDir::new().unwrap();
     fs::create_dir(fixture.path().join(".git")).unwrap();
     fs::create_dir(fixture.path().join("nested")).unwrap();
     fs::create_dir_all(fixture.path().join("nested/.git")).unwrap();
+    fs::create_dir(fixture.path().join("worktree")).unwrap();
+    fs::write(
+        fixture.path().join("worktree/.git"),
+        "gitdir: /git/worktrees/example\n",
+    )
+    .unwrap();
     let workspace = WorkspaceRoot::resolve(fixture.path()).unwrap();
     let mut tree = FileTree::new(workspace, true, false);
 
@@ -231,19 +237,22 @@ fn root_git_directory_is_hidden_by_default_and_can_be_shown() {
     );
 
     tree.expand(Path::new("nested")).unwrap();
+    tree.expand(Path::new("worktree")).unwrap();
     assert!(
         tree.visible_nodes()
             .iter()
-            .any(|node| node.path == Path::new("nested/.git"))
+            .all(|node| node.path.file_name() != Some(std::ffi::OsStr::new(".git")))
     );
 
     tree.set_show_git_directory(true);
     tree.refresh();
-    assert!(
-        tree.visible_nodes()
-            .iter()
-            .any(|node| node.path == Path::new(".git"))
-    );
+    for path in [".git", "nested/.git", "worktree/.git"] {
+        assert!(
+            tree.visible_nodes()
+                .iter()
+                .any(|node| node.path == Path::new(path))
+        );
+    }
 }
 
 fn fixture() -> TempDir {

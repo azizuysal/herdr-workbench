@@ -2,7 +2,7 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.7](https://img.shields.io/badge/version-1.0.7-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.8](https://img.shields.io/badge/version-1.0.8-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)
@@ -17,7 +17,7 @@ Herdr Workbench is a companion plugin for navigating and understanding a project
 
 - A fast Explorer with collapsible folders, colored file icons, Git decorations, and optional ignored-file visibility
 - Live filtering by file name or file contents, with case-sensitive and regular-expression modes
-- Read-only Source Control with working changes and local commit history
+- Read-only Source Control with working changes and local commit history, including folders containing multiple Git repositories
 - Flat and tree layouts for Source Control
 - Syntax-highlighted text, Markdown, and Git diff previews
 - Image and PDF previews, including zoom and pan for visual files
@@ -107,11 +107,13 @@ Content search follows Explorer ignored-file visibility: ignored content is sear
 
 Press `2` or select the branch icon to open Source Control. The Changes mode groups entries by Git state and preserves separate index and working-tree changes. Press `v` to switch between flat and tree layouts.
 
-Press `g` or select the Changes/History control to show the latest 50 commits reachable from `HEAD`, newest first. Each row shows the short hash, subject, and relative age. `Enter` or `Space` opens a syntax-highlighted commit preview with metadata, file statistics, and patch; `y` copies its full hash. History is read locally and makes no network requests. An initialized repository without a commit shows an empty history.
+When the opened folder is not itself a Git repository, Workbench discovers repositories in its subfolders, including those inside intermediate folders and linked Git worktrees. Each repository gets a collapsible section with its path and branch. Explorer applies each repository's file colors, ignored-file visibility, and folder badges. Repository discovery stops at each repository root and does not follow directory symlinks. Repositories added or removed while the sidebar is open are picked up on refresh.
+
+Press `g` or select the Changes/History control to show the latest 50 commits reachable from `HEAD` in each repository, newest first within that repository. Each row shows the short hash, subject, and relative age; nested repositories also show their workspace-relative path. `Enter` or `Space` opens a syntax-highlighted commit preview with metadata, file statistics, and patch; `y` copies its full hash. History is read locally and makes no network requests. An initialized repository without a commit shows an empty history.
 
 `Enter` or `Space` in Changes opens a syntax-highlighted diff preview. Both modes are intentionally read-only: staging, committing, discarding, branch changes, and remote operations remain in your normal Git workflow.
 
-Outside a Git repository, Source Control shows a short muted message instead of an error.
+Outside a Git repository, Source Control shows a short muted message when no repositories are found beneath the opened folder.
 
 ![Read-only Source Control groups and Git decorations](docs/screenshots/source-control.png)
 
@@ -309,6 +311,8 @@ Update the managed checkout by reinstalling:
 ```sh
 herdr plugin install azizuysal/herdr-workbench
 ```
+
+Close and reopen existing Workbench sidebars after updating so they use the new build.
 
 Remove it:
 

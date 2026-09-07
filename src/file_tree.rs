@@ -223,10 +223,7 @@ fn read_children(
         match entry {
             Ok(entry) => {
                 let name = entry.file_name();
-                if parent.as_os_str().is_empty()
-                    && name == std::ffi::OsStr::new(".git")
-                    && !show_git_directory
-                {
+                if name == std::ffi::OsStr::new(".git") && !show_git_directory {
                     continue;
                 }
                 let path = parent.join(&name);
