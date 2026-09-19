@@ -303,6 +303,8 @@ fn candidate_marker(directory: &Path) -> Result<Option<()>, GitError> {
             command: "discover Git repositories".into(),
             message: format!("unsupported symbolic link {}", marker.display()),
         }),
+        // Tools such as uv use empty .git files to isolate caches from ancestor repositories.
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => Ok(None),
         Ok(metadata) if metadata.is_dir() || metadata.is_file() => Ok(Some(())),
         Ok(_) => Err(GitError {
             command: "discover Git repositories".into(),

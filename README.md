@@ -2,7 +2,7 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.9](https://img.shields.io/badge/version-1.0.9-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.10](https://img.shields.io/badge/version-1.0.10-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)

@@ -82,6 +82,55 @@ fn an_empty_non_git_workspace_has_an_empty_successful_snapshot() {
 }
 
 #[test]
+fn empty_git_cache_markers_do_not_report_repository_errors() {
+    let fixture = TempDir::new().unwrap();
+    let workspace = fixture.path().join("workspace");
+    write(&workspace, ".build/uv-cache/sdists-v9/.git", "");
+
+    for root in [&workspace, &workspace.join(".build/uv-cache/sdists-v9")] {
+        let provider = WorkspaceGitProvider::new(root);
+        let snapshot = provider.refresh().unwrap();
+        assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+        assert!(snapshot.repositories.is_empty());
+        assert!(snapshot.combined.entries.is_empty());
+        assert!(provider.history().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn empty_git_markers_do_not_hide_sibling_or_child_repositories() {
+    let fixture = TempDir::new().unwrap();
+    let workspace = fixture.path().join("workspace");
+    write(&workspace, "cache/.git", "");
+    let child = workspace.join("cache/child");
+    let sibling = workspace.join("sibling");
+    changed_repository(&child);
+    changed_repository(&sibling);
+
+    let provider = WorkspaceGitProvider::new(&workspace);
+    let snapshot = provider.refresh().unwrap();
+    assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+    assert_eq!(
+        repository_paths(&snapshot),
+        vec![
+            child.canonicalize().unwrap(),
+            sibling.canonicalize().unwrap()
+        ]
+    );
+    for prefix in ["cache/child", "sibling"] {
+        assert!(snapshot.combined.entries.iter().any(|entry| {
+            entry.path == Path::new(prefix).join("shared.txt")
+                && entry.index_status == StatusCode::Modified
+                && entry.worktree_status == StatusCode::Modified
+        }));
+    }
+    let history = provider.history().unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].repository, Path::new("cache/child"));
+    assert_eq!(history[1].repository, Path::new("sibling"));
+}
+
+#[test]
 fn corrupt_git_marker_reports_an_error_without_hiding_healthy_siblings() {
     let fixture = TempDir::new().unwrap();
     let workspace = fixture.path().join("workspace");
