@@ -2,10 +2,12 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,21 +98,29 @@ pub trait HerdrClient: Send + Sync {
     fn request(&self, method: &str, params: Value) -> Result<Value, HerdrError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompanionEvent {
     SidebarBecameOnlyPane,
+    Directory { pane_id: String, cwd: PathBuf },
+    Error(String),
 }
 
 pub struct CompanionMonitor {
     receiver: mpsc::Receiver<CompanionEvent>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl CompanionMonitor {
-    pub fn from_env(workspace_id: &str, tab_id: &str, pane_id: &str) -> Result<Self, HerdrError> {
+    pub fn from_env(
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+        source_pane: Option<String>,
+    ) -> Result<Self, HerdrError> {
         let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
             .filter(|value| !value.is_empty())
             .ok_or(HerdrError::MissingSocket)?;
-        Self::start(&socket_path, workspace_id, tab_id, pane_id)
+        Self::start(&socket_path, workspace_id, tab_id, pane_id, source_pane)
     }
 
     pub fn try_recv(&self) -> Result<CompanionEvent, mpsc::TryRecvError> {
@@ -120,7 +130,10 @@ impl CompanionMonitor {
     #[cfg(test)]
     pub fn inactive() -> Self {
         let (_sender, receiver) = mpsc::channel();
-        Self { receiver }
+        Self {
+            receiver,
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[cfg(unix)]
@@ -129,6 +142,7 @@ impl CompanionMonitor {
         workspace_id: &str,
         tab_id: &str,
         pane_id: &str,
+        source_pane: Option<String>,
     ) -> Result<Self, HerdrError> {
         let reader = connect_layout_subscription(socket_path)?;
         let (sender, receiver) = mpsc::channel();
@@ -136,17 +150,18 @@ impl CompanionMonitor {
         let workspace_id = workspace_id.to_owned();
         let tab_id = tab_id.to_owned();
         let pane_id = pane_id.to_owned();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = Arc::clone(&stopped);
         thread::spawn(move || {
-            monitor_layouts(
-                reader,
-                &socket_path,
-                &workspace_id,
-                &tab_id,
-                &pane_id,
-                &sender,
-            );
+            let mut follower = CompanionFollower {
+                workspace_id,
+                tab_id,
+                sidebar_id: pane_id,
+                source_pane,
+            };
+            monitor_companion(reader, &socket_path, &mut follower, &sender, &task_stopped);
         });
-        Ok(Self { receiver })
+        Ok(Self { receiver, stopped })
     }
 
     #[cfg(not(unix))]
@@ -155,8 +170,72 @@ impl CompanionMonitor {
         _workspace_id: &str,
         _tab_id: &str,
         _pane_id: &str,
+        _source_pane: Option<String>,
     ) -> Result<Self, HerdrError> {
         Err(HerdrError::MissingSocket)
+    }
+}
+
+impl Drop for CompanionMonitor {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+struct CompanionFollower {
+    workspace_id: String,
+    tab_id: String,
+    sidebar_id: String,
+    source_pane: Option<String>,
+}
+
+impl CompanionFollower {
+    fn directory(
+        &mut self,
+        panes: &[PaneInfo],
+        focused: Option<&str>,
+    ) -> Result<Option<CompanionEvent>, HerdrError> {
+        let eligible = |pane: &&PaneInfo| {
+            pane.workspace_id == self.workspace_id
+                && pane.tab_id == self.tab_id
+                && pane.pane_id != self.sidebar_id
+        };
+        let pane = panes
+            .iter()
+            .filter(eligible)
+            .find(|pane| pane.focused)
+            .or_else(|| {
+                panes
+                    .iter()
+                    .filter(eligible)
+                    .find(|pane| Some(pane.pane_id.as_str()) == focused)
+            })
+            .or_else(|| {
+                panes
+                    .iter()
+                    .filter(eligible)
+                    .find(|pane| Some(&pane.pane_id) == self.source_pane.as_ref())
+            })
+            .or_else(|| panes.iter().find(eligible));
+        let Some(pane) = pane else {
+            return Ok(None);
+        };
+        self.source_pane = Some(pane.pane_id.clone());
+        let cwd = pane
+            .cwd
+            .as_deref()
+            .or(pane.foreground_cwd.as_deref())
+            .filter(|cwd| !cwd.is_empty())
+            .ok_or_else(|| {
+                HerdrError::InvalidResponse(format!(
+                    "pane {} has no current directory",
+                    pane.pane_id
+                ))
+            })?;
+        Ok(Some(CompanionEvent::Directory {
+            pane_id: pane.pane_id.clone(),
+            cwd: PathBuf::from(cwd),
+        }))
     }
 }
 
@@ -275,7 +354,7 @@ fn connect_layout_subscription(
         "id": format!("herdr-workbench-layouts:{}", std::process::id()),
         "method": "events.subscribe",
         "params": {
-            "subscriptions": [{"type": "layout.updated"}]
+            "subscriptions": [{"type": "layout.updated"}, {"type": "pane.updated"}, {"type": "pane.focused"}]
         },
     });
     serde_json::to_writer(&mut stream, &request).map_err(|source| HerdrError::InvalidJson {
@@ -305,23 +384,67 @@ fn connect_layout_subscription(
     if response.result.is_none() {
         return Err(HerdrError::EmptyResponse);
     }
-    reader.get_mut().set_read_timeout(None)?;
+    reader
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(500)))?;
     Ok(reader)
 }
 
 #[cfg(unix)]
-fn monitor_layouts(
+fn monitor_companion(
     mut reader: BufReader<std::os::unix::net::UnixStream>,
     socket_path: &OsStr,
-    workspace_id: &str,
-    tab_id: &str,
-    pane_id: &str,
+    follower: &mut CompanionFollower,
     sender: &mpsc::Sender<CompanionEvent>,
+    stopped: &AtomicBool,
 ) {
-    loop {
-        let mut line = String::new();
+    let mut line = String::new();
+    let mut refresh = true;
+    let mut focused = None;
+    let mut last_refresh = Instant::now();
+    while !stopped.load(Ordering::Relaxed) {
+        if refresh || last_refresh.elapsed() >= Duration::from_millis(500) {
+            let result = socket_request(
+                socket_path,
+                "pane.list",
+                serde_json::json!({"workspace_id": follower.workspace_id}),
+            )
+            .and_then(|value| pane_list(&value))
+            .and_then(|panes| follower.directory(&panes, focused.as_deref()));
+            let event = match result {
+                Ok(event) => event,
+                Err(error) => Some(CompanionEvent::Error(error.to_string())),
+            };
+            if let Some(event) = event
+                && sender.send(event).is_err()
+            {
+                return;
+            }
+            focused = None;
+            refresh = false;
+            last_refresh = Instant::now();
+        }
         match reader.read_line(&mut line) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
             Ok(0) | Err(_) => loop {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                if sender
+                    .send(CompanionEvent::Error(
+                        "Herdr connection lost; reconnecting".to_string(),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
                 thread::sleep(Duration::from_millis(250));
                 let Ok(next_reader) = connect_layout_subscription(socket_path) else {
                     continue;
@@ -329,29 +452,74 @@ fn monitor_layouts(
                 let Ok(layout) = socket_request(
                     socket_path,
                     "pane.layout",
-                    serde_json::json!({"pane_id": pane_id}),
+                    serde_json::json!({"pane_id": follower.sidebar_id}),
                 ) else {
                     continue;
                 };
-                match layout_has_companion(&layout, workspace_id, tab_id, pane_id) {
+                match layout_has_companion(
+                    &layout,
+                    &follower.workspace_id,
+                    &follower.tab_id,
+                    &follower.sidebar_id,
+                ) {
                     Ok(false) => {
                         let _ = sender.send(CompanionEvent::SidebarBecameOnlyPane);
                         return;
                     }
                     Ok(true) => {
                         reader = next_reader;
+                        line.clear();
+                        refresh = true;
                         break;
                     }
                     Err(_) => continue,
                 }
             },
             Ok(_) => {
-                let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                    continue;
+                let event = match serde_json::from_str::<Value>(&line) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        line.clear();
+                        if sender
+                            .send(CompanionEvent::Error(format!(
+                                "invalid Herdr event: {error}"
+                            )))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                 };
-                if layout_event_leaves_sidebar_alone(&event, workspace_id, tab_id, pane_id) {
+                line.clear();
+                if layout_event_leaves_sidebar_alone(
+                    &event,
+                    &follower.workspace_id,
+                    &follower.tab_id,
+                    &follower.sidebar_id,
+                ) {
                     let _ = sender.send(CompanionEvent::SidebarBecameOnlyPane);
                     return;
+                }
+                if event.get("event").and_then(Value::as_str) == Some("pane_focused")
+                    && event.pointer("/data/workspace_id").and_then(Value::as_str)
+                        == Some(&follower.workspace_id)
+                {
+                    focused = event
+                        .pointer("/data/pane_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    refresh = true;
+                } else if event
+                    .pointer("/data/pane/workspace_id")
+                    .and_then(Value::as_str)
+                    == Some(&follower.workspace_id)
+                    && event.pointer("/data/pane/tab_id").and_then(Value::as_str)
+                        == Some(&follower.tab_id)
+                    && event.pointer("/data/pane/pane_id").and_then(Value::as_str)
+                        != Some(&follower.sidebar_id)
+                {
+                    refresh = true;
                 }
             }
         }
@@ -496,10 +664,10 @@ pub struct PaneInfo {
 
 pub fn pane_list(value: &Value) -> Result<Vec<PaneInfo>, HerdrError> {
     let panes = value
-        .get("result")
-        .and_then(|result| result.get("panes"))
+        .get("panes")
+        .or_else(|| value.pointer("/result/panes"))
         .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
+        .ok_or_else(|| HerdrError::InvalidResponse("pane.list omitted panes".to_string()))?;
     serde_json::from_value(panes).map_err(|source| HerdrError::InvalidJson {
         context: "pane list".to_string(),
         source,
@@ -561,6 +729,117 @@ impl HerdrClient for FakeHerdr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pane(
+        pane_id: &str,
+        workspace_id: &str,
+        tab_id: &str,
+        focused: bool,
+        cwd: Option<&str>,
+        foreground_cwd: Option<&str>,
+    ) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            tab_id: tab_id.to_string(),
+            focused,
+            cwd: cwd.map(str::to_string),
+            foreground_cwd: foreground_cwd.map(str::to_string),
+            label: None,
+        }
+    }
+
+    fn follower(source_pane: Option<&str>) -> CompanionFollower {
+        CompanionFollower {
+            workspace_id: "w1".to_string(),
+            tab_id: "w1:t1".to_string(),
+            sidebar_id: "w1:sidebar".to_string(),
+            source_pane: source_pane.map(str::to_string),
+        }
+    }
+
+    fn directory(event: Option<CompanionEvent>) -> (String, PathBuf) {
+        match event.expect("directory event") {
+            CompanionEvent::Directory { pane_id, cwd } => (pane_id, cwd),
+            event => panic!("expected directory event, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn companion_follower_switches_to_the_focused_terminal_in_its_tab() {
+        let mut follower = follower(Some("w1:p1"));
+        let panes = vec![
+            pane("w1:p1", "w1", "w1:t1", false, Some("/first"), None),
+            pane("w1:p2", "w1", "w1:t1", true, Some("/second"), None),
+        ];
+
+        assert_eq!(
+            directory(follower.directory(&panes, Some("w1:p2")).unwrap()),
+            ("w1:p2".to_string(), PathBuf::from("/second"))
+        );
+        assert_eq!(follower.source_pane.as_deref(), Some("w1:p2"));
+    }
+
+    #[test]
+    fn companion_follower_keeps_its_last_terminal_for_sidebar_and_other_tabs() {
+        let mut follower = follower(Some("w1:p1"));
+        let panes = vec![
+            pane("w1:p1", "w1", "w1:t1", false, Some("/project"), None),
+            pane("w1:sidebar", "w1", "w1:t1", true, Some("/plugin"), None),
+            pane("w1:p3", "w1", "w1:t2", true, Some("/other-tab"), None),
+            pane("w2:p1", "w2", "w2:t1", true, Some("/other-workspace"), None),
+        ];
+
+        assert_eq!(
+            directory(follower.directory(&panes, Some("w1:sidebar")).unwrap()),
+            ("w1:p1".to_string(), PathBuf::from("/project"))
+        );
+    }
+
+    #[test]
+    fn companion_follower_uses_the_initial_source_before_an_arbitrary_terminal() {
+        let mut follower = follower(Some("w1:p2"));
+        let panes = vec![
+            pane("w1:p1", "w1", "w1:t1", false, Some("/first"), None),
+            pane("w1:p2", "w1", "w1:t1", false, Some("/preferred"), None),
+        ];
+
+        assert_eq!(
+            directory(follower.directory(&panes, None).unwrap()),
+            ("w1:p2".to_string(), PathBuf::from("/preferred"))
+        );
+    }
+
+    #[test]
+    fn companion_follower_prefers_pane_cwd_over_foreground_cwd() {
+        let mut follower = follower(None);
+        let panes = vec![pane(
+            "w1:p1",
+            "w1",
+            "w1:t1",
+            true,
+            Some("/shell-cwd"),
+            Some("/foreground-cwd"),
+        )];
+
+        assert_eq!(
+            directory(follower.directory(&panes, None).unwrap()),
+            ("w1:p1".to_string(), PathBuf::from("/shell-cwd"))
+        );
+    }
+
+    #[test]
+    fn companion_follower_rejects_a_selected_pane_without_a_directory() {
+        let mut follower = follower(None);
+        let panes = vec![pane("w1:p1", "w1", "w1:t1", true, None, None)];
+
+        let error = follower
+            .directory(&panes, None)
+            .expect_err("missing cwd must fail");
+        assert!(
+            matches!(error, HerdrError::InvalidResponse(message) if message == "pane w1:p1 has no current directory")
+        );
+    }
 
     #[test]
     fn pane_list_decodes_public_fields() {
@@ -657,8 +936,12 @@ mod tests {
             let request: Value = serde_json::from_str(&request).expect("subscription JSON");
             assert_eq!(request["method"], "events.subscribe");
             assert_eq!(
-                request["params"]["subscriptions"][0]["type"],
-                "layout.updated"
+                request["params"]["subscriptions"],
+                serde_json::json!([
+                    {"type": "layout.updated"},
+                    {"type": "pane.updated"},
+                    {"type": "pane.focused"}
+                ])
             );
             writeln!(
                 stream,
@@ -669,6 +952,35 @@ mod tests {
                 })
             )
             .expect("subscription response");
+            stream.flush().expect("flush subscription response");
+
+            let (mut list_stream, _) = listener.accept().expect("accept initial pane list");
+            let mut list_request = String::new();
+            BufReader::new(list_stream.try_clone().expect("clone list stream"))
+                .read_line(&mut list_request)
+                .expect("read pane list");
+            let list_request: Value = serde_json::from_str(&list_request).expect("pane list JSON");
+            assert_eq!(list_request["method"], "pane.list");
+            assert_eq!(
+                list_request["params"],
+                serde_json::json!({"workspace_id": "w1"})
+            );
+            writeln!(
+                list_stream,
+                "{}",
+                serde_json::json!({
+                    "id": list_request["id"],
+                    "result": {"panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "tab_id": "w1:t1",
+                        "focused": true,
+                        "cwd": "/project"
+                    }]}
+                })
+            )
+            .expect("pane list response");
+            list_stream.flush().expect("flush pane list response");
             writeln!(
                 stream,
                 "{}",
@@ -691,8 +1003,24 @@ mod tests {
                 .expect("keep fake socket open");
         });
 
-        let monitor =
-            CompanionMonitor::start(socket_path.as_os_str(), "w1", "w1:t1", "w1:p2").unwrap();
+        let monitor = CompanionMonitor::start(
+            socket_path.as_os_str(),
+            "w1",
+            "w1:t1",
+            "w1:p2",
+            Some("w1:p1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            monitor
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("initial directory"),
+            CompanionEvent::Directory {
+                pane_id: "w1:p1".to_string(),
+                cwd: PathBuf::from("/project")
+            }
+        );
         assert_eq!(
             monitor
                 .receiver
@@ -700,6 +1028,214 @@ mod tests {
                 .expect("companion event"),
             CompanionEvent::SidebarBecameOnlyPane
         );
+        release_sender.send(()).expect("release fake server");
+        server.join().expect("fake server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_monitor_polls_for_a_cwd_change_without_an_event() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("socket directory");
+        let socket_path = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake Herdr socket");
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut subscription, _) = listener.accept().expect("accept subscription");
+            let mut subscription_request = String::new();
+            BufReader::new(subscription.try_clone().expect("clone subscription"))
+                .read_line(&mut subscription_request)
+                .expect("read subscription");
+            let subscription_request: Value =
+                serde_json::from_str(&subscription_request).expect("subscription JSON");
+            writeln!(
+                subscription,
+                "{}",
+                serde_json::json!({"id": subscription_request["id"], "result": {"type": "events_subscribed"}})
+            )
+            .expect("subscription response");
+            subscription.flush().expect("flush subscription response");
+
+            for cwd in ["/before", "/after"] {
+                let (mut list_stream, _) = listener.accept().expect("accept pane list");
+                let mut request = String::new();
+                BufReader::new(list_stream.try_clone().expect("clone list stream"))
+                    .read_line(&mut request)
+                    .expect("read pane list");
+                let request: Value = serde_json::from_str(&request).expect("pane list JSON");
+                assert_eq!(request["method"], "pane.list");
+                writeln!(
+                    list_stream,
+                    "{}",
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": {"panes": [{
+                            "pane_id": "w1:p1",
+                            "workspace_id": "w1",
+                            "tab_id": "w1:t1",
+                            "focused": true,
+                            "cwd": cwd
+                        }]}
+                    })
+                )
+                .expect("pane list response");
+                list_stream.flush().expect("flush pane list response");
+            }
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release fake server");
+        });
+
+        let monitor = CompanionMonitor::start(
+            socket_path.as_os_str(),
+            "w1",
+            "w1:t1",
+            "w1:sidebar",
+            Some("w1:p1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            monitor
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("initial directory"),
+            CompanionEvent::Directory {
+                pane_id: "w1:p1".to_string(),
+                cwd: PathBuf::from("/before")
+            }
+        );
+        assert_eq!(
+            monitor
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("polled directory"),
+            CompanionEvent::Directory {
+                pane_id: "w1:p1".to_string(),
+                cwd: PathBuf::from("/after")
+            }
+        );
+        drop(monitor);
+        release_sender.send(()).expect("release fake server");
+        server.join().expect("fake server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_monitor_uses_the_authoritative_list_after_a_focus_event() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("socket directory");
+        let socket_path = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake Herdr socket");
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut subscription, _) = listener.accept().expect("accept subscription");
+            let mut subscription_request = String::new();
+            BufReader::new(subscription.try_clone().expect("clone subscription"))
+                .read_line(&mut subscription_request)
+                .expect("read subscription");
+            let subscription_request: Value =
+                serde_json::from_str(&subscription_request).expect("subscription JSON");
+            writeln!(
+                subscription,
+                "{}",
+                serde_json::json!({"id": subscription_request["id"], "result": {"type": "events_subscribed"}})
+            )
+            .expect("subscription response");
+            subscription.flush().expect("flush subscription response");
+
+            let (mut initial_list, _) = listener.accept().expect("accept initial pane list");
+            let mut initial_request = String::new();
+            BufReader::new(initial_list.try_clone().expect("clone initial list"))
+                .read_line(&mut initial_request)
+                .expect("read initial pane list");
+            let initial_request: Value =
+                serde_json::from_str(&initial_request).expect("initial list JSON");
+            writeln!(
+                initial_list,
+                "{}",
+                serde_json::json!({
+                    "id": initial_request["id"],
+                    "result": {"panes": [
+                        {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "focused": false, "cwd": "/source"},
+                        {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "focused": false, "cwd": "/other"}
+                    ]}
+                })
+            )
+            .expect("initial pane list response");
+            initial_list
+                .flush()
+                .expect("flush initial pane list response");
+
+            writeln!(
+                subscription,
+                "{}",
+                serde_json::json!({
+                    "event": "pane_focused",
+                    "data": {"type": "pane_focused", "workspace_id": "w1", "pane_id": "w1:p2"}
+                })
+            )
+            .expect("focus event");
+            subscription.flush().expect("flush focus event");
+
+            let (mut focused_list, _) = listener.accept().expect("accept focused pane list");
+            let mut focused_request = String::new();
+            BufReader::new(focused_list.try_clone().expect("clone focused list"))
+                .read_line(&mut focused_request)
+                .expect("read focused pane list");
+            let focused_request: Value =
+                serde_json::from_str(&focused_request).expect("focused list JSON");
+            assert_eq!(focused_request["method"], "pane.list");
+            writeln!(
+                focused_list,
+                "{}",
+                serde_json::json!({
+                    "id": focused_request["id"],
+                    "result": {"panes": [
+                        {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "focused": true, "cwd": "/authoritative"},
+                        {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "focused": false, "cwd": "/event-only"}
+                    ]}
+                })
+            )
+            .expect("focused pane list response");
+            focused_list
+                .flush()
+                .expect("flush focused pane list response");
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release fake server");
+        });
+
+        let monitor = CompanionMonitor::start(
+            socket_path.as_os_str(),
+            "w1",
+            "w1:t1",
+            "w1:sidebar",
+            Some("w1:p1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            monitor
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("initial source"),
+            CompanionEvent::Directory {
+                pane_id: "w1:p1".to_string(),
+                cwd: PathBuf::from("/source")
+            }
+        );
+        assert_eq!(
+            monitor
+                .receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("authoritative focused pane"),
+            CompanionEvent::Directory {
+                pane_id: "w1:p1".to_string(),
+                cwd: PathBuf::from("/authoritative")
+            }
+        );
+        drop(monitor);
         release_sender.send(()).expect("release fake server");
         server.join().expect("fake server");
     }

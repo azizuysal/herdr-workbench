@@ -30,6 +30,7 @@ pub enum Action {
 struct SidebarIdentity {
     root: PathBuf,
     title: String,
+    source_pane_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -146,19 +147,30 @@ impl<H: HerdrClient> Controller<H> {
         let tab_id = required_id(self.context.tab_id.as_deref(), "tab_id", "tab")?;
         let mut persisted = PersistedState::load(&self.state_path)?;
         let panes = self.list_panes(workspace_id)?;
-        let identity =
-            SidebarIdentity::new(self.sidebar_root(&persisted, workspace_id, tab_id, &panes)?)?;
-        let owned = owned_sidebar(&persisted, workspace_id, tab_id, &panes, &identity.title);
+        let saved_identity = self.saved_sidebar_identity(&persisted, workspace_id, tab_id)?;
+        let owned = saved_identity.as_ref().and_then(|identity| {
+            owned_sidebar(&persisted, workspace_id, tab_id, &panes, &identity.title)
+        });
 
         match action {
             Action::Show | Action::Focus => {
+                let identity = if owned.is_none() {
+                    Some(self.sidebar_identity_for_open(
+                        &persisted,
+                        workspace_id,
+                        tab_id,
+                        &panes,
+                    )?)
+                } else {
+                    None
+                };
                 self.show(
                     &mut persisted,
                     workspace_id,
                     tab_id,
                     &panes,
                     owned,
-                    &identity,
+                    identity.as_ref(),
                 )?;
             }
             Action::Hide => {
@@ -182,13 +194,15 @@ impl<H: HerdrClient> Controller<H> {
                 )?;
             }
             Action::Toggle => {
+                let identity =
+                    self.sidebar_identity_for_open(&persisted, workspace_id, tab_id, &panes)?;
                 self.show(
                     &mut persisted,
                     workspace_id,
                     tab_id,
                     &panes,
                     None,
-                    &identity,
+                    Some(&identity),
                 )?;
             }
             Action::ToggleDock => {
@@ -234,29 +248,28 @@ impl<H: HerdrClient> Controller<H> {
                     "cannot restore sidebar for missing tab {tab_id}"
                 )));
             }
-            let identity = SidebarIdentity::new(self.sidebar_root(
-                &persisted,
-                &workspace_id,
-                &tab_id,
-                &tab_panes,
-            )?)?;
-            let owned = owned_sidebar(
-                &persisted,
-                &workspace_id,
-                &tab_id,
-                &tab_panes,
-                &identity.title,
-            );
+            let saved_identity = self.saved_sidebar_identity(&persisted, &workspace_id, &tab_id)?;
+            let owned = saved_identity.as_ref().and_then(|identity| {
+                owned_sidebar(
+                    &persisted,
+                    &workspace_id,
+                    &tab_id,
+                    &tab_panes,
+                    &identity.title,
+                )
+            });
             if owned.is_some() {
                 continue;
             }
+            let identity =
+                self.sidebar_identity_for_open(&persisted, &workspace_id, &tab_id, &tab_panes)?;
             self.show(
                 &mut persisted,
                 &workspace_id,
                 &tab_id,
                 &tab_panes,
                 None,
-                &identity,
+                Some(&identity),
             )?;
         }
         persisted.save_atomic(&self.state_path)?;
@@ -270,9 +283,8 @@ impl<H: HerdrClient> Controller<H> {
         tab_id: &str,
         panes: &[PaneInfo],
         owned: Option<&PaneInfo>,
-        identity: &SidebarIdentity,
+        identity: Option<&SidebarIdentity>,
     ) -> Result<(), ControllerError> {
-        let title = identity.title.as_str();
         if let Some(sidebar) = owned {
             self.focus_pane(&sidebar.pane_id)?;
             let state = persisted.tab_mut(workspace_id, tab_id);
@@ -280,6 +292,12 @@ impl<H: HerdrClient> Controller<H> {
             state.pane_id = Some(sidebar.pane_id.clone());
             return Ok(());
         }
+        let identity = identity.ok_or_else(|| {
+            ControllerError::InvalidResponse(
+                "opening a sidebar requires a workspace identity".to_string(),
+            )
+        })?;
+        let title = identity.title.as_str();
 
         if panes
             .iter()
@@ -334,6 +352,12 @@ impl<H: HerdrClient> Controller<H> {
         ]);
         args.push("--env".into());
         args.push(format!("HERDR_WORKBENCH_WIDTH={width}").into());
+        args.push("--env".into());
+        args.push(format!("HERDR_WORKBENCH_ROOT={}", identity.root.to_string_lossy()).into());
+        if let Some(source_pane_id) = identity.source_pane_id.as_deref() {
+            args.push("--env".into());
+            args.push(format!("HERDR_WORKBENCH_SOURCE_PANE={source_pane_id}").into());
+        }
         if let Some(editor) = editor_environment_argument(std::env::var_os("EDITOR").as_deref()) {
             args.push("--env".into());
             args.push(editor);
@@ -358,10 +382,14 @@ impl<H: HerdrClient> Controller<H> {
         self.resize_to_width(&pane_id, width, dock_side, &post_layout)?;
 
         let state = persisted.tab_mut(workspace_id, tab_id);
+        let workspace_cwd = identity.root.to_string_lossy().into_owned();
+        if state.workspace_cwd.as_deref() != Some(workspace_cwd.as_str()) {
+            state.clear_root_state();
+        }
         state.visible = true;
         state.pane_id = Some(pane_id);
         state.previous_pane_id = focused.map(|pane| pane.pane_id.clone());
-        state.workspace_cwd = Some(identity.root.to_string_lossy().into_owned());
+        state.workspace_cwd = Some(workspace_cwd);
         state.tab_label.clone_from(&self.context.tab_label);
         state.width = width;
         Ok(())
@@ -491,45 +519,120 @@ impl<H: HerdrClient> Controller<H> {
         Ok(pane_list(&value)?)
     }
 
-    fn sidebar_root(
+    fn saved_sidebar_identity(
         &self,
         persisted: &PersistedState,
         workspace_id: &str,
         tab_id: &str,
-        panes: &[PaneInfo],
-    ) -> Result<PathBuf, ControllerError> {
-        if let Some(saved) = persisted
+    ) -> Result<Option<SidebarIdentity>, ControllerError> {
+        let saved = persisted
             .tab(workspace_id, tab_id)
             .and_then(|state| state.workspace_cwd.as_deref())
+            .map(|root| SidebarIdentity::new(PathBuf::from(root)))
+            .transpose()?;
+        if saved.is_some() {
+            return Ok(saved);
+        }
+        if self.context.workspace_id.as_deref() != Some(workspace_id)
+            || self.context.tab_id.as_deref() != Some(tab_id)
         {
-            let path = PathBuf::from(saved);
-            if !path.exists() {
-                return Ok(path);
-            }
-            return Ok(WorkspaceRoot::resolve(&path)?.path().to_owned());
+            return Ok(None);
         }
         let cwd = self
             .context
             .focused_pane_cwd
             .as_deref()
-            .or(self.context.workspace_cwd.as_deref())
-            .map(PathBuf::from)
-            .or_else(|| {
+            .or(self.context.workspace_cwd.as_deref());
+        cwd.map(|cwd| {
+            let root = WorkspaceRoot::resolve(Path::new(cwd))?;
+            SidebarIdentity::new(root.path().to_owned())
+        })
+        .transpose()
+    }
+
+    fn sidebar_identity_for_open(
+        &self,
+        persisted: &PersistedState,
+        workspace_id: &str,
+        tab_id: &str,
+        panes: &[PaneInfo],
+    ) -> Result<SidebarIdentity, ControllerError> {
+        let saved = persisted.tab(workspace_id, tab_id);
+        let sidebar_pane_id = saved.and_then(|state| state.pane_id.as_deref());
+        let saved_root = saved
+            .and_then(|state| state.workspace_cwd.as_deref())
+            .map(PathBuf::from);
+        let is_sidebar = |pane: &PaneInfo| Some(pane.pane_id.as_str()) == sidebar_pane_id;
+        let pane_cwd = |pane: &PaneInfo| {
+            pane.cwd
+                .as_deref()
+                .or(pane.foreground_cwd.as_deref())
+                .map(PathBuf::from)
+        };
+        let same_tab = |pane: &&PaneInfo| {
+            pane.workspace_id == workspace_id && pane.tab_id == tab_id && !is_sidebar(pane)
+        };
+        let candidates = [
+            panes.iter().find(|pane| same_tab(pane) && pane.focused),
+            saved.and_then(|state| {
+                state.previous_pane_id.as_deref().and_then(|pane_id| {
+                    panes
+                        .iter()
+                        .find(|pane| same_tab(pane) && pane.pane_id == pane_id)
+                })
+            }),
+            self.context.focused_pane_id.as_deref().and_then(|pane_id| {
                 panes
                     .iter()
-                    .find(|pane| pane.focused && pane.tab_id == tab_id)
-                    .and_then(|pane| pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()))
-                    .map(PathBuf::from)
-            })
-            .or_else(|| {
-                panes
-                    .iter()
-                    .find(|pane| pane.tab_id == tab_id)
-                    .and_then(|pane| pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()))
-                    .map(PathBuf::from)
-            })
-            .ok_or(ControllerError::MissingContext("workspace_cwd"))?;
-        Ok(WorkspaceRoot::resolve(&cwd)?.path().to_owned())
+                    .find(|pane| same_tab(pane) && pane.pane_id == pane_id)
+            }),
+            panes.iter().find(same_tab),
+        ];
+        for pane in candidates.into_iter().flatten() {
+            if let Some(cwd) = pane_cwd(pane) {
+                return self.identity_following_saved_root(
+                    saved_root.as_deref(),
+                    &cwd,
+                    Some(&pane.pane_id),
+                );
+            }
+        }
+
+        let matching_context = self.context.workspace_id.as_deref() == Some(workspace_id)
+            && self.context.tab_id.as_deref() == Some(tab_id)
+            && self.context.focused_pane_id.as_deref() != sidebar_pane_id;
+        if matching_context
+            && let Some(cwd) = self
+                .context
+                .focused_pane_cwd
+                .as_deref()
+                .or(self.context.workspace_cwd.as_deref())
+        {
+            return self.identity_following_saved_root(
+                saved_root.as_deref(),
+                Path::new(cwd),
+                self.context.focused_pane_id.as_deref(),
+            );
+        }
+        if let Some(root) = saved_root {
+            return SidebarIdentity::new(root);
+        }
+        Err(ControllerError::MissingContext("workspace_cwd"))
+    }
+
+    fn identity_following_saved_root(
+        &self,
+        saved_root: Option<&Path>,
+        cwd: &Path,
+        source_pane_id: Option<&str>,
+    ) -> Result<SidebarIdentity, ControllerError> {
+        let root = match saved_root {
+            Some(saved_root) if saved_root.exists() => {
+                WorkspaceRoot::from_directory(saved_root)?.following(cwd)?
+            }
+            _ => WorkspaceRoot::resolve(cwd)?,
+        };
+        SidebarIdentity::with_source(root.path().to_owned(), source_pane_id.map(str::to_owned))
     }
 
     fn layout(&self, pane_id: &str) -> Result<Value, ControllerError> {
@@ -682,7 +785,7 @@ fn has_sidebar_title(pane: &PaneInfo, title: &str) -> bool {
     pane.label.as_deref() == Some(title)
 }
 
-fn sidebar_title(root: &Path) -> Result<String, ControllerError> {
+pub(crate) fn sidebar_title(root: &Path) -> Result<String, ControllerError> {
     let name = root.file_name().unwrap_or(root.as_os_str());
     let title = sanitize_terminal(&name.to_string_lossy().to_uppercase());
     if title.is_empty() {
@@ -696,7 +799,17 @@ fn sidebar_title(root: &Path) -> Result<String, ControllerError> {
 impl SidebarIdentity {
     fn new(root: PathBuf) -> Result<Self, ControllerError> {
         let title = sidebar_title(&root)?;
-        Ok(Self { root, title })
+        Ok(Self {
+            root,
+            title,
+            source_pane_id: None,
+        })
+    }
+
+    fn with_source(root: PathBuf, source_pane_id: Option<String>) -> Result<Self, ControllerError> {
+        let mut identity = Self::new(root)?;
+        identity.source_pane_id = source_pane_id;
+        Ok(identity)
     }
 }
 
@@ -843,7 +956,7 @@ fn lock_path(state_path: &Path) -> PathBuf {
         .join(ACTION_LOCK_FILE)
 }
 
-struct ActionLock {
+pub(crate) struct ActionLock {
     path: PathBuf,
     held: bool,
 }
@@ -917,6 +1030,10 @@ impl ActionLock {
     }
 }
 
+pub(crate) fn lock_state(state_path: &Path) -> Result<ActionLock, ControllerError> {
+    ActionLock::acquire(lock_path(state_path))
+}
+
 impl Drop for ActionLock {
     fn drop(&mut self) {
         if self.held {
@@ -945,15 +1062,41 @@ mod tests {
         }
     }
 
-    fn pane_list_response(sidebar: bool) -> Value {
+    fn project_cwd(temp: &TempDir) -> String {
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("project directory");
+        project
+            .canonicalize()
+            .expect("canonical project")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn pane_list_response(temp: &TempDir, sidebar: bool) -> Value {
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("project directory");
         let mut panes = vec![serde_json::json!({
             "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
-            "focused": !sidebar, "cwd": "/tmp/project"
+            "focused": !sidebar, "cwd": project
         })];
         if sidebar {
             panes.push(serde_json::json!({
                 "pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1",
-                "focused": true, "cwd": "/tmp/project", "label": TEST_SIDEBAR_TITLE
+                "focused": true, "cwd": temp.path().join("project"), "label": TEST_SIDEBAR_TITLE
+            }));
+        }
+        serde_json::json!({"result": {"panes": panes}})
+    }
+
+    fn pane_list_for_paths(terminal_cwd: &Path, sidebar: Option<(&str, &str)>) -> Value {
+        let mut panes = vec![serde_json::json!({
+            "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "focused": sidebar.is_none(), "cwd": terminal_cwd,
+        })];
+        if let Some((pane_id, title)) = sidebar {
+            panes.push(serde_json::json!({
+                "pane_id": pane_id, "workspace_id": "w1", "tab_id": "w1:t1",
+                "focused": true, "label": title,
             }));
         }
         serde_json::json!({"result": {"panes": panes}})
@@ -1038,7 +1181,7 @@ mod tests {
         let temp = TempDir::new().expect("temp");
         let state_path = temp.path().join("state.json");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(false)),
+            Ok(pane_list_response(&temp, false)),
             Ok(layout_response(false)),
             Ok(serde_json::json!({"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}})),
             Ok(serde_json::json!({"result":{}})),
@@ -1068,6 +1211,10 @@ mod tests {
             !open_args.contains(&"--cwd"),
             "the plugin binary must start from HERDR_PLUGIN_ROOT; workspace identity comes from context"
         );
+        assert!(
+            open_args.contains(&format!("HERDR_WORKBENCH_ROOT={}", project_cwd(&temp)).as_str())
+        );
+        assert!(open_args.contains(&"HERDR_WORKBENCH_SOURCE_PANE=w1:p1"));
         assert_eq!(
             calls[3].1,
             serde_json::json!(["pane", "rename", "w1:p2", TEST_SIDEBAR_TITLE])
@@ -1092,7 +1239,7 @@ mod tests {
         state.tab_mut("w1", "w1:t1").dock_side = DockSide::Right;
         state.save_atomic(&state_path).expect("save");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(false)),
+            Ok(pane_list_response(&temp, false)),
             Ok(layout_response(false)),
             Ok(serde_json::json!({"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}})),
             Ok(serde_json::json!({"result":{}})),
@@ -1139,9 +1286,10 @@ mod tests {
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
         tab.dock_side = DockSide::Left;
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).expect("save");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(left_layout_response(32)),
             Ok(serde_json::json!({"result":{"swap":{"changed":true}}})),
             Ok(right_layout_response(68)),
@@ -1174,7 +1322,7 @@ mod tests {
         assert_eq!(calls[4].1[5], "right");
 
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(right_layout_response(32)),
             Ok(serde_json::json!({"result":{"swap":{"changed":true}}})),
             Ok(left_layout_response(68)),
@@ -1203,9 +1351,10 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).expect("save");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(left_layout_response(32)),
             Ok(serde_json::json!({
                 "result":{"swap":{"changed":false,"reason":"not_found"}}
@@ -1237,14 +1386,207 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).expect("save");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(serde_json::json!({"result":{}})),
             Ok(serde_json::json!({"result":{}})),
         ]);
         let controller = Controller::new(fake, context(&temp), state_path, Config::default());
         controller.execute(Action::Show).expect("show");
+        let calls = controller.herdr.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[1].1,
+            serde_json::json!(["pane", "zoom", "w1:p2", "--on"])
+        );
+        assert_eq!(
+            calls[2].1,
+            serde_json::json!(["pane", "zoom", "w1:p2", "--off"])
+        );
+    }
+
+    #[test]
+    fn live_terminal_cwd_wins_a_stale_persisted_root_when_reopening() {
+        let temp = TempDir::new().expect("temp");
+        let old_root = temp.path().join("old-project");
+        let new_root = temp.path().join("new-project");
+        fs::create_dir_all(&old_root).expect("old project");
+        fs::create_dir_all(&new_root).expect("new project");
+        let state_path = temp.path().join("state.json");
+        let mut state = PersistedState::default();
+        let tab = state.tab_mut("w1", "w1:t1");
+        tab.workspace_cwd = Some(old_root.to_string_lossy().into_owned());
+        tab.pane_id = Some("w1:closed-sidebar".to_string());
+        tab.width = 41;
+        tab.dock_side = DockSide::Right;
+        tab.expanded.insert("old-directory".to_string());
+        tab.selection = Some("old-selection".to_string());
+        tab.git_tree_expanded
+            .insert("old-git-directory".to_string());
+        tab.git_tree_initialized = true;
+        tab.git_collapsed_groups.insert("old-group".to_string());
+        tab.scroll = 12;
+        state.save_atomic(&state_path).expect("save");
+        let fake = FakeHerdr::new([
+            Ok(pane_list_for_paths(&new_root, None)),
+            Ok(layout_response(false)),
+            Ok(serde_json::json!({"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}})),
+            Ok(serde_json::json!({"result":{}})),
+            Ok(serde_json::json!({"result":{}})),
+            Ok(layout_response(true)),
+        ]);
+        let controller = Controller::new(fake, context(&temp), state_path, Config::default());
+
+        controller.execute(Action::Show).expect("reopen sidebar");
+
+        let calls = controller.herdr.calls();
+        let open_args = calls[2].1.as_array().expect("argv");
+        let expected_root = format!(
+            "HERDR_WORKBENCH_ROOT={}",
+            new_root
+                .canonicalize()
+                .expect("canonical new root")
+                .display()
+        );
+        assert!(
+            open_args
+                .iter()
+                .any(|argument| argument.as_str() == Some(expected_root.as_str()))
+        );
+        assert_eq!(
+            calls[3].1,
+            serde_json::json!(["pane", "rename", "w1:p2", "NEW-PROJECT"])
+        );
+        let tab = PersistedState::load(&temp.path().join("state.json"))
+            .expect("state")
+            .tab("w1", "w1:t1")
+            .expect("tab")
+            .clone();
+        assert!(tab.expanded.is_empty());
+        assert_eq!(tab.selection, None);
+        assert!(tab.git_tree_expanded.is_empty());
+        assert!(!tab.git_tree_initialized);
+        assert!(tab.git_collapsed_groups.is_empty());
+        assert_eq!(tab.scroll, 0);
+        assert_eq!(tab.width, 41);
+        assert_eq!(tab.dock_side, DockSide::Right);
+    }
+
+    #[test]
+    fn reopening_within_a_saved_parent_workspace_keeps_the_parent_root() {
+        let temp = TempDir::new().expect("temp");
+        let parent = temp.path().join("parent");
+        let child_repository = parent.join("child-repository");
+        fs::create_dir_all(&child_repository).expect("child repository");
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&child_repository)
+            .status()
+            .expect("git init");
+        assert!(git.success());
+        let state_path = temp.path().join("state.json");
+        let mut state = PersistedState::default();
+        let tab = state.tab_mut("w1", "w1:t1");
+        tab.workspace_cwd = Some(parent.to_string_lossy().into_owned());
+        tab.pane_id = Some("w1:closed-sidebar".to_string());
+        state.save_atomic(&state_path).expect("save");
+        let fake = FakeHerdr::new([
+            Ok(pane_list_for_paths(&child_repository, None)),
+            Ok(layout_response(false)),
+            Ok(serde_json::json!({"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}})),
+            Ok(serde_json::json!({"result":{}})),
+            Ok(serde_json::json!({"result":{}})),
+            Ok(layout_response(true)),
+        ]);
+        let controller = Controller::new(fake, context(&temp), state_path, Config::default());
+
+        controller.execute(Action::Show).expect("reopen sidebar");
+
+        let calls = controller.herdr.calls();
+        let open_args = calls[2].1.as_array().expect("argv");
+        let expected_root = format!(
+            "HERDR_WORKBENCH_ROOT={}",
+            parent.canonicalize().expect("canonical parent").display()
+        );
+        assert!(
+            open_args
+                .iter()
+                .any(|argument| argument.as_str() == Some(expected_root.as_str()))
+        );
+    }
+
+    #[test]
+    fn hide_recognizes_the_registered_sidebar_before_following_terminal_cwd() {
+        let temp = TempDir::new().expect("temp");
+        let old_root = temp.path().join("old-project");
+        let new_root = temp.path().join("new-project");
+        fs::create_dir_all(&old_root).expect("old project");
+        fs::create_dir_all(&new_root).expect("new project");
+        let state_path = temp.path().join("state.json");
+        let mut state = PersistedState::default();
+        let tab = state.tab_mut("w1", "w1:t1");
+        tab.visible = true;
+        tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(old_root.to_string_lossy().into_owned());
+        state.save_atomic(&state_path).expect("save");
+        let fake = FakeHerdr::new([
+            Ok(pane_list_for_paths(
+                &new_root,
+                Some(("w1:p2", "OLD-PROJECT")),
+            )),
+            Ok(layout_response(true)),
+            Ok(serde_json::json!({"result":{}})),
+        ]);
+        let controller =
+            Controller::new(fake, context(&temp), state_path.clone(), Config::default());
+
+        controller
+            .execute(Action::Hide)
+            .expect("hide owned sidebar");
+
+        assert_eq!(
+            controller.herdr.calls()[2].1,
+            serde_json::json!(["pane", "close", "w1:p2"])
+        );
+        assert!(
+            !PersistedState::load(&state_path)
+                .expect("state")
+                .tab("w1", "w1:t1")
+                .expect("tab")
+                .visible
+        );
+    }
+
+    #[test]
+    fn focus_recognizes_the_registered_sidebar_before_following_terminal_cwd() {
+        let temp = TempDir::new().expect("temp");
+        let old_root = temp.path().join("old-project");
+        let new_root = temp.path().join("new-project");
+        fs::create_dir_all(&old_root).expect("old project");
+        fs::create_dir_all(&new_root).expect("new project");
+        let state_path = temp.path().join("state.json");
+        let mut state = PersistedState::default();
+        let tab = state.tab_mut("w1", "w1:t1");
+        tab.visible = true;
+        tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(old_root.to_string_lossy().into_owned());
+        state.save_atomic(&state_path).expect("save");
+        let fake = FakeHerdr::new([
+            Ok(pane_list_for_paths(
+                &new_root,
+                Some(("w1:p2", "OLD-PROJECT")),
+            )),
+            Ok(serde_json::json!({"result":{}})),
+            Ok(serde_json::json!({"result":{}})),
+        ]);
+        let controller = Controller::new(fake, context(&temp), state_path, Config::default());
+
+        controller
+            .execute(Action::Focus)
+            .expect("focus owned sidebar");
+
         let calls = controller.herdr.calls();
         assert_eq!(calls.len(), 3);
         assert_eq!(
@@ -1325,9 +1667,10 @@ mod tests {
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
         tab.previous_pane_id = Some("w1:p1".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).expect("save");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(layout_response(true)),
             Ok(serde_json::json!({"result":{}})),
             Ok(serde_json::json!({"result":{}})),
@@ -1362,6 +1705,7 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).expect("save");
         let only_sidebar = serde_json::json!({
             "result": {"panes": [{
@@ -1405,7 +1749,7 @@ mod tests {
         let temp = TempDir::new().expect("temp");
         let hidden_path = temp.path().join("hidden.json");
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(false)),
+            Ok(pane_list_response(&temp, false)),
             Ok(layout_response(false)),
             Ok(serde_json::json!({"result":{"plugin_pane":{"pane":{"pane_id":"w1:p2"}}}})),
             Ok(serde_json::json!({"result":{}})),
@@ -1430,9 +1774,10 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&toggle_path).unwrap();
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(layout_response(true)),
             Ok(serde_json::json!({"result":{}})),
         ]);
@@ -1456,8 +1801,9 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).unwrap();
-        let fake = FakeHerdr::new([Ok(pane_list_response(true))]);
+        let fake = FakeHerdr::new([Ok(pane_list_response(&temp, true))]);
         let controller =
             Controller::new(fake, context(&temp), state_path.clone(), Config::default());
         controller
@@ -1468,7 +1814,7 @@ mod tests {
         let mut stale = PersistedState::load(&state_path).unwrap();
         stale.tab_mut("w1", "w1:t1").pane_id = Some("w1:stale".to_string());
         stale.save_atomic(&state_path).unwrap();
-        let fake = FakeHerdr::new([Ok(pane_list_response(true))]);
+        let fake = FakeHerdr::new([Ok(pane_list_response(&temp, true))]);
         let controller = Controller::new(fake, context(&temp), state_path, Config::default());
         assert!(matches!(
             controller.restore(),
@@ -1507,9 +1853,10 @@ mod tests {
         let tab = state.tab_mut("w1", "w1:t1");
         tab.visible = true;
         tab.pane_id = Some("w1:p2".to_string());
+        tab.workspace_cwd = Some(project_cwd(&temp));
         state.save_atomic(&state_path).unwrap();
         let fake = FakeHerdr::new([
-            Ok(pane_list_response(true)),
+            Ok(pane_list_response(&temp, true)),
             Ok(layout_response(true)),
             Err(HerdrError::Api {
                 code: "close_failed".to_string(),

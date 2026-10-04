@@ -2,7 +2,7 @@
 
 ### A polished project sidebar for Herdr
 
-[![Version 1.0.10](https://img.shields.io/badge/version-1.0.10-7aa2f7)](herdr-plugin.toml)
+[![Version 1.0.11](https://img.shields.io/badge/version-1.0.11-7aa2f7)](herdr-plugin.toml)
 [![Herdr 0.7.5+](https://img.shields.io/badge/Herdr-0.7.5%2B-9ece6a)](https://herdr.dev)
 [![Platforms macOS and Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-bb9af7)](#requirements)
 [![License MIT](https://img.shields.io/badge/license-MIT-f7768e)](LICENSE)
@@ -83,6 +83,12 @@ herdr plugin link .
 Use `herdr plugin unlink herdr-workbench` before switching back to an installed release.
 
 ## Everyday use
+
+### Following terminal folders
+
+Workbench follows the last focused terminal pane in its tab and checks its current folder every half-second. Changing to another repository switches Explorer, Search, and Source Control together. Moving within the same repository keeps its root open. A parent folder containing multiple repositories stays open while you navigate beneath it; leaving that parent switches to the new repository or folder.
+
+Focusing Workbench or opening a preview retains the terminal's folder. Switching folders preserves the sidebar's width, dock side, and view preferences. Active searches run against the new folder, and reopening the sidebar uses the terminal's current folder.
 
 ### Explorer
 

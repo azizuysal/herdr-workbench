@@ -200,6 +200,17 @@ impl Default for PersistedState {
     }
 }
 
+impl SidebarState {
+    pub(crate) fn clear_root_state(&mut self) {
+        self.expanded.clear();
+        self.selection = None;
+        self.scroll = 0;
+        self.git_tree_expanded.clear();
+        self.git_tree_initialized = false;
+        self.git_collapsed_groups.clear();
+    }
+}
+
 impl PersistedState {
     pub fn load(path: &Path) -> Result<Self, StateError> {
         load(path)

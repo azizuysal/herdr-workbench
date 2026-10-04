@@ -20,7 +20,8 @@ use ratatui::backend::CrosstermBackend;
 use crate::clipboard::{ClipboardWriter, HerdrClipboard};
 use crate::config::{self, Config, LoadedConfig};
 use crate::controller::{
-    Action, Controller, register_sidebar_instance, unregister_sidebar_instance,
+    Action, Controller, lock_state, register_sidebar_instance, sidebar_title,
+    unregister_sidebar_instance,
 };
 use crate::decoration::{GitCoordinates, GitState};
 use crate::file_manager::{FileManagerOpener, SystemFileManagerOpener};
@@ -48,6 +49,20 @@ const REFRESH_DEBOUNCE: Duration = Duration::from_millis(180);
 const CONFIG_POLL: Duration = Duration::from_millis(500);
 const BUSY_FRAME_INTERVAL: Duration = Duration::from_millis(125);
 
+fn watch_workspace(
+    root: &Path,
+) -> notify::Result<(
+    notify::RecommendedWatcher,
+    mpsc::Receiver<notify::Result<notify::Event>>,
+)> {
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
+    Ok((watcher, receiver))
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     register_sidebar_instance()?;
     let context = InvocationContext::from_env()?;
@@ -58,7 +73,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(context.workspace_cwd.as_deref())
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let workspace = WorkspaceRoot::resolve(&cwd)?;
+    let workspace = match std::env::var_os("HERDR_WORKBENCH_ROOT") {
+        Some(root) => WorkspaceRoot::from_directory(Path::new(&root))?,
+        None => WorkspaceRoot::resolve(&cwd)?,
+    };
     let state_path = crate::state::state_path_from_env()?;
     let state = PersistedState::load(&state_path)?;
     let workspace_id = std::env::var("HERDR_WORKSPACE_ID")
@@ -66,7 +84,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tab_id =
         std::env::var("HERDR_TAB_ID").or(context.tab_id.clone().ok_or("missing tab id"))?;
     let pane_id = std::env::var("HERDR_PANE_ID")?;
-    let companion_monitor = CompanionMonitor::from_env(&workspace_id, &tab_id, &pane_id)?;
+    let source_pane = std::env::var("HERDR_WORKBENCH_SOURCE_PANE")
+        .ok()
+        .or_else(|| {
+            state
+                .tab(&workspace_id, &tab_id)
+                .and_then(|saved| saved.previous_pane_id.clone())
+        })
+        .or_else(|| context.focused_pane_id.clone());
+    let companion_monitor =
+        CompanionMonitor::from_env(&workspace_id, &tab_id, &pane_id, source_pane.clone())?;
     let herdr = LiveHerdr::from_env();
     let layout = herdr.request("pane.layout", serde_json::json!({"pane_id": pane_id}))?;
     if !layout_has_companion(&layout, &workspace_id, &tab_id, &pane_id)? {
@@ -85,6 +112,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         companion_monitor,
         load_theme(),
     )?;
+    application.source_pane_id = source_pane;
     loop {
         let outcome = terminal_loop(&mut application)?;
         application.persist(outcome != LoopOutcome::Exit)?;
@@ -162,10 +190,7 @@ fn terminal_loop(application: &mut SidebarApp) -> Result<LoopOutcome, Box<dyn st
 
     loop {
         application.poll_background();
-        if matches!(
-            application.companion_monitor.try_recv(),
-            Ok(CompanionEvent::SidebarBecameOnlyPane)
-        ) {
+        if application.poll_companion() {
             return Ok(LoopOutcome::Exit);
         }
         let mut model = application.render_model();
@@ -264,6 +289,9 @@ enum SearchItem {
 
 struct SidebarApp {
     context: InvocationContext,
+    herdr: Box<dyn HerdrClient>,
+    source_pane_id: Option<String>,
+    context_error: Option<String>,
     workspace: WorkspaceRoot,
     workspace_id: String,
     tab_id: String,
@@ -339,10 +367,17 @@ impl SidebarApp {
             include_ignored: show_ignored,
             ..SearchQuery::default()
         };
-        let saved = persisted
+        let mut saved = persisted
             .tab(&workspace_id, &tab_id)
             .cloned()
             .unwrap_or_default();
+        if saved
+            .workspace_cwd
+            .as_deref()
+            .is_some_and(|root| Path::new(root) != workspace.path())
+        {
+            saved.clear_root_state();
+        }
         let mut tree = FileTree::new(
             workspace.clone(),
             config.show_ignored,
@@ -374,23 +409,13 @@ impl SidebarApp {
         let git_history_receiver = None;
         let busy = true;
         let search = SearchProvider::new(workspace.path());
-        let (sender, receiver) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
-        })
-        .ok();
-        if let Some(active_watcher) = watcher.as_mut() {
-            let _ = active_watcher.watch(workspace.path(), RecursiveMode::Recursive);
-            if let Some(path) = loaded_config.path.parent() {
-                let _ = active_watcher.watch(path, RecursiveMode::NonRecursive);
-            }
-            if let Some(path) = theme_path.as_ref().and_then(|path| path.parent()) {
-                let _ = active_watcher.watch(path, RecursiveMode::NonRecursive);
-            }
-        }
+        let (watcher, receiver) = watch_workspace(workspace.path())?;
         let config_modified = file_modified(&loaded_config.path);
         Ok(Self {
             context,
+            herdr: Box::new(LiveHerdr::from_env()),
+            source_pane_id: saved.previous_pane_id.clone(),
+            context_error: None,
             workspace,
             workspace_id,
             tab_id,
@@ -439,7 +464,7 @@ impl SidebarApp {
             appearance: None,
             config_modified,
             show_ignored,
-            _watcher: watcher,
+            _watcher: Some(watcher),
             watch_events: receiver,
             pending_refresh: None,
             last_config_poll: Instant::now(),
@@ -481,8 +506,9 @@ impl SidebarApp {
                 && self.git_error.is_none())
             .then(|| "No Git repositories\nNo repositories found in this folder.".to_string()),
             error: self
-                .error
+                .context_error
                 .clone()
+                .or_else(|| self.error.clone())
                 .or_else(|| {
                     self.search_active
                         .then(|| self.search_error.clone())
@@ -1725,6 +1751,103 @@ impl SidebarApp {
         self.refresh_git();
     }
 
+    fn poll_companion(&mut self) -> bool {
+        // Coalesce queued directory changes before replacing any folder state.
+        let mut latest = None;
+        while let Ok(event) = self.companion_monitor.try_recv() {
+            if event == CompanionEvent::SidebarBecameOnlyPane {
+                return true;
+            }
+            latest = Some(event);
+        }
+        match latest {
+            Some(CompanionEvent::Directory { pane_id, cwd }) => {
+                self.context_error = self
+                    .follow_directory(&pane_id, &cwd)
+                    .err()
+                    .map(|error| format!("Cannot follow terminal folder\n{error}"));
+            }
+            Some(CompanionEvent::Error(error)) => {
+                self.context_error = Some(format!("Cannot follow terminal folder\n{error}"));
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn follow_directory(
+        &mut self,
+        pane_id: &str,
+        cwd: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = self.workspace.following(cwd)?;
+        if workspace.path() == self.workspace.path() {
+            if self.source_pane_id.as_deref() != Some(pane_id) || self.context_error.is_some() {
+                self.source_pane_id = Some(pane_id.to_owned());
+                self.persist(true)?;
+            }
+            return Ok(());
+        }
+
+        let mut tree = FileTree::new(
+            workspace.clone(),
+            self.show_ignored,
+            self.config.follow_symlinks,
+        );
+        tree.set_show_git_directory(self.config.show_git_directory);
+        tree.expand(Path::new(""))?;
+        let (watcher, receiver) = watch_workspace(workspace.path())?;
+        let _lock = lock_state(&self.state_path)?;
+        self.persisted = PersistedState::load(&self.state_path)?;
+        let sidebar_id = self
+            .persisted
+            .tab(&self.workspace_id, &self.tab_id)
+            .and_then(|saved| saved.pane_id.as_deref())
+            .ok_or("sidebar pane identity is unavailable")?;
+        self.herdr.request(
+            "pane.rename",
+            serde_json::json!({
+                "pane_id": sidebar_id,
+                "label": sidebar_title(workspace.path())?,
+            }),
+        )?;
+
+        if let Some(handle) = self.search_handle.take() {
+            handle.cancel();
+        }
+        self.git = WorkspaceGitProvider::new(workspace.path());
+        self.git_receiver = Some(self.git.refresh_async());
+        self.git_snapshot = None;
+        self.git_repositories.clear();
+        self.git_refresh_pending = false;
+        self.git_error = None;
+        self.git_history_receiver = None;
+        self.git_history.clear();
+        self.git_history_refresh_pending = false;
+        self.git_history_error = None;
+        self.git_tree_expanded.clear();
+        self.git_tree_initialized = false;
+        self.git_collapsed_groups.clear();
+        self.search = SearchProvider::new(workspace.path());
+        self.search_results = SearchResults::default();
+        self.search_error = None;
+        self.search_origin = self.search_active.then_some((0, 0));
+        self.tree = tree;
+        self.workspace = workspace;
+        self._watcher = Some(watcher);
+        self.watch_events = receiver;
+        self.pending_refresh = None;
+        self.selection = 0;
+        self.offset = 0;
+        self.error = self.theme.diagnostic.clone();
+        self.source_pane_id = Some(pane_id.to_owned());
+        if self.search_active {
+            self.start_search();
+        }
+        self.update_busy();
+        self.persist_locked(true)
+    }
+
     fn refresh_git(&mut self) {
         if self.git_receiver.is_none() {
             self.git_receiver = Some(self.git.refresh_async());
@@ -1747,8 +1870,9 @@ impl SidebarApp {
 
     fn poll_background(&mut self) {
         while let Ok(event) = self.watch_events.try_recv() {
-            if event.is_ok() {
-                self.pending_refresh = Some(Instant::now());
+            match event {
+                Ok(_) => self.pending_refresh = Some(Instant::now()),
+                Err(error) => self.error = Some(format!("Cannot watch workspace\n{error}")),
             }
         }
         if self
@@ -2030,6 +2154,12 @@ impl SidebarApp {
     }
 
     fn persist(&mut self, visible: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = lock_state(&self.state_path)?;
+        self.persist_locked(visible)
+    }
+
+    fn persist_locked(&mut self, visible: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.persisted = PersistedState::load(&self.state_path)?;
         let expanded: BTreeSet<String> = self
             .tree
             .visible_nodes()
@@ -2078,6 +2208,7 @@ impl SidebarApp {
             self.offset
         };
         state.workspace_cwd = Some(self.workspace.path().to_string_lossy().into_owned());
+        state.previous_pane_id.clone_from(&self.source_pane_id);
         self.persisted.save_atomic(&self.state_path)?;
         Ok(())
     }
@@ -3022,6 +3153,167 @@ mod tests {
         std::fs::write(repository.join("same.txt"), "worktree\n").unwrap();
         std::fs::create_dir(repository.join("ignored")).unwrap();
         std::fs::write(repository.join("ignored/cache.txt"), "ignored\n").unwrap();
+    }
+
+    fn enable_test_following(app: &mut SidebarApp) {
+        let saved = app.persisted.tab_mut(&app.workspace_id, &app.tab_id);
+        saved.pane_id = Some("sidebar".to_string());
+        saved.workspace_cwd = Some(app.workspace.path().to_string_lossy().into_owned());
+        saved.dock_side = crate::state::DockSide::Right;
+        saved.width = 44;
+        app.persisted.save_atomic(&app.state_path).unwrap();
+        app.herdr = Box::new(crate::herdr::FakeHerdr::new([]));
+    }
+
+    #[test]
+    fn following_another_repository_replaces_all_root_bound_state_and_discards_old_results() {
+        let (_old, mut app) = test_app_with_setup(|root| create_nested_fixture(root, "old"));
+        wait_for_git(&mut app);
+        enable_test_following(&mut app);
+        let next = tempfile::tempdir().unwrap();
+        create_nested_fixture(next.path(), "new");
+        let new_root = next.path().join("new").canonicalize().unwrap();
+        app.git_content_mode = GitContentMode::History;
+        app.git_view_mode = GitViewMode::Tree;
+        app.git_tree_expanded.insert("old/same.txt".to_string());
+        app.git_collapsed_groups.insert("old".to_string());
+        app.selection = 7;
+        app.offset = 5;
+        app.search_active = true;
+        app.search_query.mode = SearchMode::Literal;
+        app.search_query.text = "worktree".to_string();
+        app.start_search();
+        let (old_git, receiver) = mpsc::channel();
+        app.git_receiver = Some(receiver);
+        let (old_history, receiver) = mpsc::channel();
+        app.git_history_receiver = Some(receiver);
+        let (old_watch, receiver) = mpsc::channel();
+        app.watch_events = receiver;
+        app.pending_refresh = Some(Instant::now());
+        let mut concurrent_state = PersistedState::load(&app.state_path).unwrap();
+        concurrent_state
+            .tab_mut("another-workspace", "another-tab")
+            .width = 65;
+        concurrent_state.save_atomic(&app.state_path).unwrap();
+
+        app.follow_directory("terminal-b", &new_root).unwrap();
+
+        assert_eq!(app.workspace.path(), new_root);
+        assert_eq!((app.selection, app.offset), (0, 0));
+        assert!(app.git_snapshot.is_none());
+        assert!(app.git_repositories.is_empty());
+        assert!(app.git_history.is_empty());
+        assert!(app.git_collapsed_groups.is_empty());
+        assert!(app.pending_refresh.is_none());
+        assert!(
+            old_git
+                .send(Ok(WorkspaceGitSnapshot {
+                    combined: GitSnapshot::default(),
+                    repositories: Vec::new(),
+                    errors: Vec::new()
+                }))
+                .is_err()
+        );
+        assert!(old_history.send(Ok(Vec::new())).is_err());
+        assert!(
+            old_watch
+                .send(Ok(notify::Event::new(notify::EventKind::Any)))
+                .is_err()
+        );
+        wait_for_git(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.search_handle.is_some() && Instant::now() < deadline {
+            app.poll_background();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.search_handle.is_none());
+        assert_eq!(app.git_repositories.len(), 1);
+        assert_eq!(app.git_repositories[0].root, new_root);
+        assert_eq!(app.git_history.len(), 1);
+        assert_eq!(app.git_history[0].commit.summary, "new");
+        assert_eq!(app.search_results.files.len(), 1);
+        assert_eq!(app.search_results.files[0].path, Path::new("same.txt"));
+        assert!(
+            app.explorer_items()
+                .iter()
+                .all(|entry| entry.path != Path::new("old"))
+        );
+        let saved = PersistedState::load(&app.state_path).unwrap();
+        let tab = saved.tab(&app.workspace_id, &app.tab_id).unwrap();
+        assert_eq!(tab.workspace_cwd.as_deref(), new_root.to_str());
+        assert_eq!(tab.previous_pane_id.as_deref(), Some("terminal-b"));
+        assert_eq!(tab.pane_id.as_deref(), Some("sidebar"));
+        assert_eq!(tab.dock_side, crate::state::DockSide::Right);
+        assert_eq!(tab.width, 44);
+        assert_eq!(
+            saved.tab("another-workspace", "another-tab").unwrap().width,
+            65
+        );
+
+        std::fs::write(new_root.join("created-after-switch.txt"), "new file\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .explorer_items()
+            .iter()
+            .any(|entry| entry.path == Path::new("created-after-switch.txt"))
+            && Instant::now() < deadline
+        {
+            app.poll_background();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.explorer_items()
+                .iter()
+                .any(|entry| entry.path == Path::new("created-after-switch.txt"))
+        );
+    }
+
+    #[test]
+    fn following_within_a_parent_workspace_preserves_tree_selection_and_search() {
+        let (directory, mut app) = test_app_with_setup(|root| create_nested_fixture(root, "child"));
+        enable_test_following(&mut app);
+        app.tree.expand(Path::new("child")).unwrap();
+        app.selection = 2;
+        app.search_query.text = "keep query".to_string();
+        let root = app.workspace.path().to_owned();
+        app.follow_directory("terminal", &directory.path().join("child"))
+            .unwrap();
+        assert_eq!(app.workspace.path(), root);
+        assert_eq!(app.selection, 2);
+        assert_eq!(app.search_query.text, "keep query");
+        assert!(
+            app.explorer_items()
+                .iter()
+                .any(|entry| entry.path == Path::new("child/same.txt"))
+        );
+    }
+
+    #[test]
+    fn failed_directory_switch_retains_the_previous_workspace() {
+        let (_directory, mut app) = test_app();
+        enable_test_following(&mut app);
+        let next = tempfile::tempdir().unwrap();
+        let root = app.workspace.path().to_owned();
+        assert!(
+            app.follow_directory("terminal", &next.path().join("missing"))
+                .is_err()
+        );
+        assert_eq!(app.workspace.path(), root);
+        app.herdr = Box::new(crate::herdr::FakeHerdr::new([Err(
+            crate::herdr::HerdrError::InvalidResponse("rename failed".to_string()),
+        )]));
+        assert!(
+            app.follow_directory("terminal", next.path())
+                .unwrap_err()
+                .to_string()
+                .contains("rename failed")
+        );
+        assert_eq!(app.workspace.path(), root);
+        assert!(
+            app.explorer_items()
+                .iter()
+                .any(|entry| entry.path == Path::new("child.txt"))
+        );
     }
 
     #[test]
